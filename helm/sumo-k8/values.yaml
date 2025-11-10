@@ -1,0 +1,78 @@
+replicaCount: 2
+
+image:
+  repository: sumo-k8-controller
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+serviceAccount:
+  create: true
+  name: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: sumo-k8.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+
+postgres:
+  enabled: true
+  image:
+    repository: postgres
+    tag: "14-alpine"
+  persistence:
+    enabled: true
+    size: 10Gi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+config:
+  logLevel: "INFO"
+  maxFileSizeMB: 100
+  maxJobDurationHours: 24
+  configmapCleanupDelaySeconds: 300
+  maxConcurrentJobsPerTenant: 10
+  dbPoolMin: 2
+  dbPoolMax: 10
+  corsOrigins: "*"
+
+database:
+  url: ""  # If empty, uses postgres service if postgres.enabled=true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+

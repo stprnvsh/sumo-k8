@@ -1,0 +1,14 @@
+apiVersion: v2
+name: sumo-k8
+description: Multi-tenant Kubernetes job controller for SUMO simulations
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - sumo
+  - kubernetes
+  - simulation
+  - multi-tenant
+maintainers:
+  - name: SUMO-K8 Team
+

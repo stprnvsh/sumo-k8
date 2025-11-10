@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sumo-k8-config
+  namespace: sumo-k8
+data:
+  LOG_LEVEL: "INFO"
+  MAX_FILE_SIZE_MB: "100"
+  MAX_JOB_DURATION_HOURS: "24"
+  CONFIGMAP_CLEANUP_DELAY_SECONDS: "300"
+  MAX_CONCURRENT_JOBS_PER_TENANT: "10"
+  DB_POOL_MIN: "2"
+  DB_POOL_MAX: "10"
+  CORS_ORIGINS: "*"
+

@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: sumo-k8-controller
+  namespace: sumo-k8
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: sumo-k8.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: sumo-k8-controller
+            port:
+              number: 80
+---
+# For cloud providers, update host and annotations:
+# AWS ALB:
+#   annotations:
+#     kubernetes.io/ingress.class: alb
+#     alb.ingress.kubernetes.io/scheme: internet-facing
+#     alb.ingress.kubernetes.io/target-type: ip
+#
+# GKE:
+#   annotations:
+#     kubernetes.io/ingress.class: gce
+#
+# Azure:
+#   annotations:
+#     kubernetes.io/ingress.class: azure/application-gateway
+
