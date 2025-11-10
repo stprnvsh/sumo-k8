@@ -76,3 +76,6 @@ temp/
 .DS_Store
 Thumbs.db
 
+# Large test files
+test_networks/zips/sumo-scenarios.zip
+
