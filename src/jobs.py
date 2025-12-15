@@ -132,7 +132,10 @@ mkdir -p /workspace
 cd /workspace
 
 echo "Reassembling SUMO files from {num_chunks} chunks..."
-cat /config/chunk*/chunk > sumo_files.zip.b64
+# Sort chunks numerically (chunk0, chunk1, chunk2... not chunk0, chunk1, chunk10...)
+for i in $(seq 0 {num_chunks - 1}); do
+    cat /config/chunk$i/chunk >> sumo_files.zip.b64
+done
 base64 -d sumo_files.zip.b64 > sumo_files.zip
 rm sumo_files.zip.b64
 
