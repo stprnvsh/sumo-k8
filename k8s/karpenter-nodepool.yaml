@@ -26,14 +26,9 @@ spec:
           operator: In
           values:
             - c5.4xlarge
-            - c5.2xlarge
-            - c5.xlarge
-            - c5n.4xlarge
-            - c5n.2xlarge
-            - c5n.xlarge
-            - m5.4xlarge
-            - m5.2xlarge
-            - m5.xlarge
+            - c6i.4xlarge
+            - c6a.4xlarge
+            - c7i.4xlarge
   # Limits
   limits:
     cpu: "200"  # Max 200 CPUs total
