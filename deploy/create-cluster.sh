@@ -397,33 +397,65 @@ SCEOF
 }
 POLICYEOF
     
-    # Create policy if it doesn't exist
-    POLICY_ARN=$(aws iam list-policies --query "Policies[?PolicyName=='EKSClusterAutoscalerPolicy'].Arn" --output text --region "${AWS_REGION}" 2>/dev/null || echo "")
-    if [ -z "$POLICY_ARN" ]; then
-        POLICY_ARN=$(aws iam create-policy --policy-name EKSClusterAutoscalerPolicy --policy-document file:///tmp/cluster-autoscaler-policy.json --region "${AWS_REGION}" --query 'Policy.Arn' --output text 2>/dev/null || echo "")
-    fi
+    # Deploy Karpenter for fast auto-scaling
+    echo -e "${YELLOW}Installing Karpenter for auto-scaling...${NC}"
     
-    if [ -n "$POLICY_ARN" ]; then
-        # Attach policy to infrastructure node role
-        INFRA_ROLE=$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name infrastructure-nodes --region "${AWS_REGION}" --query 'nodegroup.nodeRole' --output text 2>/dev/null | cut -d'/' -f2)
-        if [ -n "$INFRA_ROLE" ]; then
-            aws iam attach-role-policy --role-name "$INFRA_ROLE" --policy-arn "$POLICY_ARN" 2>/dev/null || true
-        fi
-        
-        # Attach policy to simulation node role
-        SIM_ROLE=$(aws eks describe-nodegroup --cluster-name "${CLUSTER_NAME}" --nodegroup-name simulation-nodes --region "${AWS_REGION}" --query 'nodegroup.nodeRole' --output text 2>/dev/null | cut -d'/' -f2)
-        if [ -n "$SIM_ROLE" ]; then
-            aws iam attach-role-policy --role-name "$SIM_ROLE" --policy-arn "$POLICY_ARN" 2>/dev/null || true
-        fi
-        
-        # Deploy Cluster Autoscaler
-        kubectl apply -f "$PROJECT_DIR/k8s/cluster-autoscaler.yaml"
-        
-        echo -e "${GREEN}✓ Cluster Autoscaler installed (scales simulation nodes 0-50, 30s scale-down)${NC}"
-    else
-        echo -e "${YELLOW}⚠ Could not create IAM policy. Install Cluster Autoscaler manually:${NC}"
-        echo "  kubectl apply -f $PROJECT_DIR/k8s/cluster-autoscaler.yaml"
-    fi
+    # Create KarpenterNodeRole
+    aws iam create-role --role-name "KarpenterNodeRole-${CLUSTER_NAME}" \
+        --assume-role-policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ec2.amazonaws.com"},
+                "Action": "sts:AssumeRole"
+            }]
+        }' 2>/dev/null || true
+    
+    # Attach required policies to KarpenterNodeRole
+    for POLICY in AmazonEKSWorkerNodePolicy AmazonEKS_CNI_Policy AmazonEC2ContainerRegistryReadOnly AmazonSSMManagedInstanceCore; do
+        aws iam attach-role-policy --role-name "KarpenterNodeRole-${CLUSTER_NAME}" \
+            --policy-arn "arn:aws:iam::aws:policy/$POLICY" 2>/dev/null || true
+    done
+    
+    # Add S3 permissions for results upload
+    aws iam put-role-policy --role-name "KarpenterNodeRole-${CLUSTER_NAME}" \
+        --policy-name S3ResultsAccess --policy-document '{
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:ListBucket"],
+                "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"]
+            }]
+        }' 2>/dev/null || true
+    
+    # Create instance profile for Karpenter nodes
+    aws iam create-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile-${CLUSTER_NAME}" 2>/dev/null || true
+    aws iam add-role-to-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile-${CLUSTER_NAME}" \
+        --role-name "KarpenterNodeRole-${CLUSTER_NAME}" 2>/dev/null || true
+    
+    # Install Karpenter using Helm
+    helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+        --version 1.0.0 \
+        --namespace kube-system \
+        --set "settings.clusterName=${CLUSTER_NAME}" \
+        --set "settings.interruptionQueue=${CLUSTER_NAME}" \
+        --set controller.resources.requests.cpu=1 \
+        --set controller.resources.requests.memory=1Gi \
+        --set controller.resources.limits.cpu=1 \
+        --set controller.resources.limits.memory=1Gi \
+        --wait 2>/dev/null || {
+            echo -e "${YELLOW}Karpenter Helm install failed, applying CRDs manually...${NC}"
+            kubectl apply -f https://raw.githubusercontent.com/aws/karpenter/v1.0.0/pkg/apis/crds/karpenter.sh_nodepools.yaml 2>/dev/null || true
+            kubectl apply -f https://raw.githubusercontent.com/aws/karpenter/v1.0.0/pkg/apis/crds/karpenter.sh_nodeclaims.yaml 2>/dev/null || true
+            kubectl apply -f https://raw.githubusercontent.com/aws/karpenter/v1.0.0/pkg/apis/crds/karpenter.k8s.aws_ec2nodeclasses.yaml 2>/dev/null || true
+        }
+    
+    # Apply Karpenter NodePool and NodeClass (substitute cluster name)
+    echo -e "${YELLOW}Applying Karpenter NodePool and NodeClass...${NC}"
+    sed "s|CLUSTER_NAME_PLACEHOLDER|${CLUSTER_NAME}|g" "$PROJECT_DIR/k8s/karpenter-nodeclass.yaml" | kubectl apply -f -
+    kubectl apply -f "$PROJECT_DIR/k8s/karpenter-nodepool.yaml"
+    
+    echo -e "${GREEN}✓ Karpenter installed (scales 0→50 nodes, 30s scale-down)${NC}"
 }
 
 # Create AKS cluster

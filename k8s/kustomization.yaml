@@ -6,11 +6,15 @@ namespace: sumo-k8
 resources:
   - namespace.yaml
   - serviceaccount.yaml
+  - rbac.yaml
+  - storageclass.yaml
   - configmap.yaml
   - deployment.yaml
   - service.yaml
-  # - ingress.yaml  # Uncomment if using ingress
-  # - postgres.yaml  # Uncomment if deploying PostgreSQL in cluster
+  # - postgres.yaml    # Uncomment for in-cluster PostgreSQL
+  # - ingress.yaml     # Uncomment for Ingress
+  # - karpenter-nodepool.yaml     # For EKS with Karpenter
+  # - karpenter-nodeclass.yaml    # For EKS with Karpenter
 
 commonLabels:
   app: sumo-k8-controller

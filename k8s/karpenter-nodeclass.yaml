@@ -3,17 +3,17 @@ kind: EC2NodeClass
 metadata:
   name: simulation-nodeclass
 spec:
-  # AMI family - use AL2023 (has support for K8s 1.33)
+  # AMI family - AL2023 supports K8s 1.33+
   amiFamily: AL2023
-  # Subnet selector - use all subnets in the cluster (tagged with karpenter.sh/discovery)
+  # Subnet selector - deploy script replaces CLUSTER_NAME_PLACEHOLDER
   subnetSelectorTerms:
     - tags:
-        karpenter.sh/discovery: "sumo-k8-cluster"
+        karpenter.sh/discovery: "CLUSTER_NAME_PLACEHOLDER"
   # Security group selector
   securityGroupSelectorTerms:
     - tags:
-        karpenter.sh/discovery: "sumo-k8-cluster"
-  # Block device mappings for root volume
+        karpenter.sh/discovery: "CLUSTER_NAME_PLACEHOLDER"
+  # Root volume
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:
@@ -21,12 +21,10 @@ spec:
         volumeType: gp3
         encrypted: true
         deleteOnTermination: true
-  # IAM role for nodes (created during cluster setup)
-  # Note: This references the IAM role name, not the instance profile
-  role: "KarpenterNodeRole-sumo-k8-cluster"
-  # User data for node initialization
+  # IAM role (deploy script replaces CLUSTER_NAME_PLACEHOLDER)
+  role: "KarpenterNodeRole-CLUSTER_NAME_PLACEHOLDER"
+  # Bootstrap script
   userData: |
     #!/bin/bash
-    /etc/eks/bootstrap.sh sumo-k8-cluster
-    # NodePool already labels with node-type=simulation via template.metadata.labels
+    /etc/eks/bootstrap.sh CLUSTER_NAME_PLACEHOLDER
 

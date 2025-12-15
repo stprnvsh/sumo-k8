@@ -92,9 +92,9 @@ def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
         return pvc_name
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            # Create PVC with storage class
+            # Use ReadWriteOnce (works with EBS and most block storage)
             pvc_spec = client.V1PersistentVolumeClaimSpec(
-                access_modes=["ReadWriteMany"],
+                access_modes=["ReadWriteOnce"],
                 resources=client.V1ResourceRequirements(
                     requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
                 )
@@ -111,7 +111,7 @@ def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
             )
             try:
                 k8s_core.create_namespaced_persistent_volume_claim(tenant_namespace, pvc)
-                logger.info(f"Created PVC {pvc_name} for tenant {tenant_namespace} with storage class {storage_class}")
+                logger.info(f"Created PVC {pvc_name} for tenant {tenant_namespace}")
                 return pvc_name
             except Exception as create_error:
                 logger.error(f"Failed to create PVC {pvc_name}: {create_error}")

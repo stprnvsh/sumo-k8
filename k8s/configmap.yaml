@@ -4,15 +4,28 @@ metadata:
   name: sumo-k8-config
   namespace: sumo-k8
 data:
+  # Logging
   LOG_LEVEL: "INFO"
+  # Job limits
   MAX_FILE_SIZE_MB: "100"
   MAX_JOB_DURATION_HOURS: "24"
-  CONFIGMAP_CLEANUP_DELAY_SECONDS: "300"
   MAX_CONCURRENT_JOBS_PER_TENANT: "10"
+  # Cleanup
+  CONFIGMAP_CLEANUP_DELAY_SECONDS: "300"
+  # Database pool
   DB_POOL_MIN: "2"
   DB_POOL_MAX: "10"
+  # CORS (set specific origins in production)
   CORS_ORIGINS: "*"
-  RESULT_STORAGE_TYPE: "s3"
-  S3_BUCKET: "transcality-simulations"
-  S3_REGION: "eu-central-2"
+  # Storage: auto, pvc, s3, gcs, azure
+  RESULT_STORAGE_TYPE: "auto"
+  RESULT_STORAGE_SIZE_GI: "10"
+  # S3 (set if using S3 storage)
+  # S3_BUCKET: "your-bucket-name"
+  # S3_REGION: "your-region"
+  # GCS (set if using GCS storage)
+  # GCS_BUCKET: "your-bucket-name"
+  # Azure (set if using Azure storage)
+  # AZURE_STORAGE_ACCOUNT: "your-account"
+  # AZURE_CONTAINER: "your-container"
 

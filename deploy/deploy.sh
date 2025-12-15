@@ -221,8 +221,8 @@ fi
 # ============================================================================
 echo -e "${BLUE}[7/8] Deploying SUMO-K8 controller...${NC}"
 
-# Update image in deployment and apply
-sed "s|image:.*sumo-k8-controller.*|image: ${FULL_IMAGE}|g" "$PROJECT_DIR/k8s/deployment.yaml" | kubectl apply -f -
+# Replace IMAGE_PLACEHOLDER with actual image and apply
+sed "s|image: IMAGE_PLACEHOLDER|image: ${FULL_IMAGE}|g" "$PROJECT_DIR/k8s/deployment.yaml" | kubectl apply -f -
 
 kubectl apply -f "$PROJECT_DIR/k8s/service.yaml"
 
@@ -235,25 +235,13 @@ kubectl wait --for=condition=available --timeout=300s deployment/sumo-k8-control
 }
 
 # ============================================================================
-# STEP 8: Deploy Cluster Autoscaler (optional, for EKS)
-# ============================================================================
-echo -e "${BLUE}[8/9] Checking Cluster Autoscaler...${NC}"
-if kubectl get deployment cluster-autoscaler -n kube-system &>/dev/null; then
-    echo -e "${YELLOW}Cluster Autoscaler already exists, skipping${NC}"
-else
-    echo -e "${YELLOW}Note: Cluster Autoscaler requires IAM permissions. Install manually if needed:${NC}"
-    echo "  kubectl apply -f $PROJECT_DIR/k8s/cluster-autoscaler.yaml"
-    echo "  Then attach IAM policy to node instance roles"
-fi
-
-# ============================================================================
-# STEP 9: Deploy Ingress (if enabled)
+# STEP 8: Deploy Ingress (if enabled)
 # ============================================================================
 if [ "$DEPLOY_INGRESS" = true ]; then
-    echo -e "${BLUE}[9/9] Deploying Ingress...${NC}"
+    echo -e "${BLUE}[8/8] Deploying Ingress...${NC}"
     kubectl apply -f "$PROJECT_DIR/k8s/ingress.yaml"
 else
-    echo -e "${BLUE}[9/9] Skipping Ingress${NC}"
+    echo -e "${BLUE}[8/8] Skipping Ingress${NC}"
 fi
 
 # ============================================================================

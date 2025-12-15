@@ -1,6 +1,6 @@
 # SUMO-K8 Controller Deployment
-# This deployment runs on INFRASTRUCTURE nodes (t3.large, always-on instances)
-# Infrastructure nodes: t3.large (8GB RAM) - for controller, postgres, and system components
+# Runs on INFRASTRUCTURE nodes (always-on, cost-effective instances)
+# Deploy script will replace IMAGE_PLACEHOLDER with actual image
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,12 +19,12 @@ spec:
         app: sumo-k8-controller
     spec:
       serviceAccountName: sumo-k8-controller
-      # Schedule on infrastructure nodes (t3.large, 8GB RAM)
+      # Schedule on infrastructure nodes
       nodeSelector:
         node-type: infrastructure
       containers:
       - name: app
-        image: 154794777636.dkr.ecr.eu-central-2.amazonaws.com/sumo-k8-controller:latest
+        image: IMAGE_PLACEHOLDER
         imagePullPolicy: Always
         ports:
         - containerPort: 8000
