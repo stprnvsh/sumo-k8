@@ -25,10 +25,10 @@ spec:
         - key: node.kubernetes.io/instance-type
           operator: In
           values:
-            - c5.4xlarge
-            - c6i.4xlarge
-            - c6a.4xlarge
-            - c7i.4xlarge
+            - c5.4xlarge   # 16 vCPU, 32GB RAM
+            - c7i.4xlarge  # 16 vCPU, 32GB RAM
+            - c7i.8xlarge  # 32 vCPU, 64GB RAM
+            - c5.9xlarge   # 36 vCPU, 72GB RAM
   # Limits
   limits:
     cpu: "200"  # Max 200 CPUs total
@@ -37,4 +37,3 @@ spec:
   disruption:
     consolidationPolicy: WhenEmpty
     consolidateAfter: 30s  # Scale down 30 seconds after node is empty
-
