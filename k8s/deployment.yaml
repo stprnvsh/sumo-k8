@@ -1,3 +1,6 @@
+# SUMO-K8 Controller Deployment
+# This deployment runs on INFRASTRUCTURE nodes (t3.large, always-on instances)
+# Infrastructure nodes: t3.large (8GB RAM) - for controller, postgres, and system components
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -16,10 +19,13 @@ spec:
         app: sumo-k8-controller
     spec:
       serviceAccountName: sumo-k8-controller
+      # Schedule on infrastructure nodes (t3.large, 8GB RAM)
+      nodeSelector:
+        node-type: infrastructure
       containers:
       - name: app
-        image: sumo-k8-controller:latest
-        imagePullPolicy: IfNotPresent
+        image: 154794777636.dkr.ecr.eu-central-2.amazonaws.com/sumo-k8-controller:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
           name: http
@@ -29,6 +35,12 @@ spec:
             secretKeyRef:
               name: sumo-k8-secrets
               key: DATABASE_URL
+        - name: ADMIN_KEY
+          valueFrom:
+            secretKeyRef:
+              name: sumo-k8-secrets
+              key: ADMIN_KEY
+              optional: true
         envFrom:
         - configMapRef:
             name: sumo-k8-config

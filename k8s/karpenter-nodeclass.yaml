@@ -1,0 +1,32 @@
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: simulation-nodeclass
+spec:
+  # AMI family - use AL2023 (has support for K8s 1.33)
+  amiFamily: AL2023
+  # Subnet selector - use all subnets in the cluster (tagged with karpenter.sh/discovery)
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "sumo-k8-cluster"
+  # Security group selector
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "sumo-k8-cluster"
+  # Block device mappings for root volume
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+  # IAM role for nodes (created during cluster setup)
+  # Note: This references the IAM role name, not the instance profile
+  role: "KarpenterNodeRole-sumo-k8-cluster"
+  # User data for node initialization
+  userData: |
+    #!/bin/bash
+    /etc/eks/bootstrap.sh sumo-k8-cluster
+    # NodePool already labels with node-type=simulation via template.metadata.labels
+

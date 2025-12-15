@@ -272,6 +272,11 @@ fi
                     labels={"job-id": job_id, "tenant": tenant['tenant_id']}
                 ),
                 spec=client.V1PodSpec(
+                    # Schedule on simulation nodes (large, on-demand instances)
+                    # Simulation nodes: c5.4xlarge or similar - scale from 0, created on-demand
+                    node_selector={
+                        "node-type": "simulation"
+                    },
                     containers=[
                         client.V1Container(
                             name="sumo",

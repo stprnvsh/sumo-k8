@@ -21,6 +21,9 @@ DEFAULT_MAX_CONCURRENT_JOBS = int(os.getenv("DEFAULT_MAX_CONCURRENT_JOBS", "2"))
 API_KEY_PREFIX = os.getenv("API_KEY_PREFIX", "sk-")
 API_KEY_LENGTH = int(os.getenv("API_KEY_LENGTH", "32"))
 
+# Admin authentication
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")  # Set via environment variable or secret
+
 # CORS
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 

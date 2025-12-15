@@ -70,7 +70,11 @@ config:
 database:
   url: ""  # If empty, uses postgres service if postgres.enabled=true
 
-nodeSelector: {}
+# Node selector for infrastructure nodes
+# Infrastructure nodes: t3.small - for controller, postgres, system components
+# Simulation nodes: c5.4xlarge or similar - for SUMO simulation jobs only
+nodeSelector:
+  node-type: infrastructure
 
 tolerations: []
 

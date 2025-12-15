@@ -6,7 +6,7 @@ from fastapi import HTTPException, Header
 from typing import Optional
 import logging
 from .database import get_db
-from .config import API_KEY_PREFIX, API_KEY_LENGTH, DEFAULT_MAX_CPU, DEFAULT_MAX_MEMORY_GI, DEFAULT_MAX_CONCURRENT_JOBS
+from .config import API_KEY_PREFIX, API_KEY_LENGTH, DEFAULT_MAX_CPU, DEFAULT_MAX_MEMORY_GI, DEFAULT_MAX_CONCURRENT_JOBS, ADMIN_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,17 @@ def get_tenant_from_header(authorization: Optional[str] = Header(None, alias="Au
     
     logger.debug(f"Authenticating with API key starting with: {api_key[:10]}...")
     return auth_tenant(api_key)
+
+def auth_admin(admin_key: Optional[str] = Header(None, alias="X-Admin-Key")):
+    """Authenticate admin operations"""
+    if not ADMIN_KEY:
+        logger.warning("ADMIN_KEY not set - admin endpoints are disabled")
+        raise HTTPException(status_code=503, detail="Admin authentication not configured")
+    
+    if not admin_key or admin_key.strip() != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    
+    return True
 
 def create_tenant(tenant_id: str, max_cpu: Optional[int] = None, 
                   max_memory_gi: Optional[int] = None, 

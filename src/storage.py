@@ -57,12 +57,34 @@ def detect_storage_type() -> str:
         logger.warning(f"Error detecting storage type: {e}, defaulting to PVC")
         return "pvc"
 
+def get_default_storage_class() -> Optional[str]:
+    """Get the default storage class name"""
+    if not k8s_available:
+        return None
+    try:
+        storage_api = client.StorageV1Api()
+        storage_classes = storage_api.list_storage_class()
+        for sc in storage_classes.items:
+            # Check if it's the default (annotation or common names)
+            annotations = sc.metadata.annotations or {}
+            if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
+                return sc.metadata.name
+        # Fallback: return first storage class or common defaults
+        if storage_classes.items:
+            return storage_classes.items[0].metadata.name
+        # Common defaults for cloud providers
+        return "ebs-gp3"  # EKS EBS CSI driver (Kubernetes 1.32+ compatible)
+    except Exception as e:
+        logger.warning(f"Error getting storage class: {e}, using default 'ebs-gp3'")
+        return "ebs-gp3"
+
 def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
     """Ensure PVC exists for tenant results storage"""
     if not k8s_available:
         return None
     
     pvc_name = f"results-{tenant_namespace}"
+    storage_class = get_default_storage_class()
     
     try:
         k8s_core.read_namespaced_persistent_volume_claim(pvc_name, tenant_namespace)
@@ -70,22 +92,26 @@ def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
         return pvc_name
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            # Create PVC
+            # Create PVC with storage class
+            pvc_spec = client.V1PersistentVolumeClaimSpec(
+                access_modes=["ReadWriteMany"],
+                resources=client.V1ResourceRequirements(
+                    requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
+                )
+            )
+            if storage_class:
+                pvc_spec.storage_class_name = storage_class
+            
             pvc = client.V1PersistentVolumeClaim(
                 metadata=client.V1ObjectMeta(
                     name=pvc_name,
                     namespace=tenant_namespace
                 ),
-                spec=client.V1PersistentVolumeClaimSpec(
-                    access_modes=["ReadWriteMany"],
-                    resources=client.V1ResourceRequirements(
-                        requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
-                    )
-                )
+                spec=pvc_spec
             )
             try:
                 k8s_core.create_namespaced_persistent_volume_claim(tenant_namespace, pvc)
-                logger.info(f"Created PVC {pvc_name} for tenant {tenant_namespace}")
+                logger.info(f"Created PVC {pvc_name} for tenant {tenant_namespace} with storage class {storage_class}")
                 return pvc_name
             except Exception as create_error:
                 logger.error(f"Failed to create PVC {pvc_name}: {create_error}")
@@ -105,7 +131,7 @@ def upload_to_s3(job_id: str, tenant_id: str, local_path: str) -> Optional[Dict[
         from botocore.exceptions import ClientError
         
         s3_client = boto3.client('s3', region_name=S3_REGION)
-        prefix = f"results/{tenant_id}/{job_id}/"
+        prefix = f"sumo-k8-results/{tenant_id}/{job_id}/"
         
         uploaded_files = []
         
@@ -274,7 +300,7 @@ from pathlib import Path
 
 s3 = boto3.client('s3', region_name='{S3_REGION}')
 bucket = '{S3_BUCKET}'
-prefix = 'results/{tenant_id}/{job_id}/'
+prefix = 'sumo-k8-results/{tenant_id}/{job_id}/'
 results_dir = Path('/results/{job_id}')
 
 if not results_dir.exists():
@@ -572,7 +598,7 @@ def get_result_storage_info(job_id: str, tenant_namespace: str, storage_type: st
         return {
             "storage_type": "s3",
             "bucket": S3_BUCKET,
-            "prefix": f"results/{tenant_namespace}/{job_id}/"
+            "prefix": f"sumo-k8-results/{tenant_namespace}/{job_id}/"
         }
     elif storage_type == "gcs":
         return {

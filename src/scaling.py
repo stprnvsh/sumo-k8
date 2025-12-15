@@ -1,5 +1,6 @@
 """Kubernetes resource management and scaling"""
 import logging
+from typing import Optional
 from kubernetes import client
 from .k8s_client import k8s_available, k8s_core, k8s_batch
 from .config import CONFIGMAP_CLEANUP_DELAY_SECONDS, RESULT_STORAGE_SIZE_GI
@@ -121,6 +122,24 @@ def ensure_tenant_namespace(tenant):
     logger.info(f"Creating PVC for namespace {ns_name} (required for result storage)")
     ensure_tenant_pvc(ns_name)
 
+def get_default_storage_class() -> Optional[str]:
+    """Get the default storage class name"""
+    if not k8s_available:
+        return None
+    try:
+        storage_api = client.StorageV1Api()
+        storage_classes = storage_api.list_storage_class()
+        for sc in storage_classes.items:
+            annotations = sc.metadata.annotations or {}
+            if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
+                return sc.metadata.name
+        if storage_classes.items:
+            return storage_classes.items[0].metadata.name
+        return "ebs-gp3"  # EKS EBS CSI driver (Kubernetes 1.32+ compatible)
+    except Exception as e:
+        logger.warning(f"Error getting storage class: {e}, using default 'ebs-gp3'")
+        return "ebs-gp3"
+
 def ensure_tenant_pvc(tenant_namespace: str):
     """Ensure PVC exists for tenant results storage"""
     if not k8s_available:
@@ -128,6 +147,7 @@ def ensure_tenant_pvc(tenant_namespace: str):
         return
     
     pvc_name = f"results-{tenant_namespace}"
+    storage_class = get_default_storage_class()
     logger.debug(f"Checking for PVC {pvc_name} in namespace {tenant_namespace}")
     
     try:
@@ -135,43 +155,29 @@ def ensure_tenant_pvc(tenant_namespace: str):
         logger.info(f"PVC {pvc_name} already exists")
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            # Try ReadWriteMany first, fallback to ReadWriteOnce
-            logger.info(f"PVC {pvc_name} not found, creating...")
+            # Use ReadWriteOnce for EBS (ReadWriteMany not supported)
+            logger.info(f"PVC {pvc_name} not found, creating with storage class {storage_class}...")
             try:
+                pvc_spec = client.V1PersistentVolumeClaimSpec(
+                    access_modes=["ReadWriteOnce"],
+                    resources=client.V1ResourceRequirements(
+                        requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
+                    )
+                )
+                if storage_class:
+                    pvc_spec.storage_class_name = storage_class
+                
                 pvc = client.V1PersistentVolumeClaim(
                     metadata=client.V1ObjectMeta(
                         name=pvc_name,
                         namespace=tenant_namespace
                     ),
-                    spec=client.V1PersistentVolumeClaimSpec(
-                        access_modes=["ReadWriteMany"],
-                        resources=client.V1ResourceRequirements(
-                            requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
-                        )
-                    )
+                    spec=pvc_spec
                 )
                 k8s_core.create_namespaced_persistent_volume_claim(tenant_namespace, pvc)
-                logger.info(f"Created PVC {pvc_name} with ReadWriteMany")
+                logger.info(f"Created PVC {pvc_name} with ReadWriteOnce and storage class {storage_class}")
             except Exception as create_error:
-                # Fallback to ReadWriteOnce if ReadWriteMany not supported
-                logger.warning(f"ReadWriteMany not supported, using ReadWriteOnce: {create_error}")
-                try:
-                    pvc = client.V1PersistentVolumeClaim(
-                        metadata=client.V1ObjectMeta(
-                            name=pvc_name,
-                            namespace=tenant_namespace
-                        ),
-                        spec=client.V1PersistentVolumeClaimSpec(
-                            access_modes=["ReadWriteOnce"],
-                            resources=client.V1ResourceRequirements(
-                                requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
-                            )
-                        )
-                    )
-                    k8s_core.create_namespaced_persistent_volume_claim(tenant_namespace, pvc)
-                    logger.info(f"Created PVC {pvc_name} with ReadWriteOnce")
-                except Exception as fallback_error:
-                    logger.error(f"Failed to create PVC {pvc_name} with ReadWriteOnce: {fallback_error}")
+                logger.error(f"Failed to create PVC {pvc_name}: {create_error}")
         else:
             logger.error(f"Error checking PVC {pvc_name}: {e}")
 

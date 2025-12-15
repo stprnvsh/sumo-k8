@@ -5,7 +5,7 @@ import sys
 import threading
 import logging
 from datetime import datetime
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,7 +15,7 @@ from src.database import init_db_pool, close_db_pool, get_db
 from src.k8s_client import k8s_available
 from src.auth import (
     get_tenant_from_header, create_tenant, regenerate_api_key,
-    get_tenant, list_tenants, update_tenant_limits
+    get_tenant, list_tenants, update_tenant_limits, auth_admin
 )
 from src.jobs import submit_job, get_job_status, get_job_logs
 from src.logs import stream_job_logs
@@ -98,8 +98,8 @@ def readiness_check():
 # ============================================================================
 
 @app.post("/auth/register", response_model=TenantResponse)
-def register_tenant(tenant_data: TenantCreate):
-    """Create a new tenant account"""
+def register_tenant(tenant_data: TenantCreate, _: bool = Depends(auth_admin)):
+    """Create a new tenant account (admin only)"""
     tenant = create_tenant(
         tenant_id=tenant_data.tenant_id,
         max_cpu=tenant_data.max_cpu,
@@ -113,23 +113,23 @@ def register_tenant(tenant_data: TenantCreate):
     return tenant
 
 @app.post("/auth/regenerate-key", response_model=TenantResponse)
-def regenerate_key(request: APIKeyRegenerate):
-    """Regenerate API key for a tenant (admin operation)"""
+def regenerate_key(request: APIKeyRegenerate, _: bool = Depends(auth_admin)):
+    """Regenerate API key for a tenant (admin only)"""
     return regenerate_api_key(request.tenant_id)
 
 @app.get("/auth/tenants")
-def list_all_tenants():
-    """List all tenants (admin endpoint)"""
+def list_all_tenants(_: bool = Depends(auth_admin)):
+    """List all tenants (admin only)"""
     return {"tenants": list_tenants()}
 
 @app.get("/auth/tenants/{tenant_id}", response_model=TenantResponse)
-def get_tenant_info(tenant_id: str):
-    """Get tenant information"""
+def get_tenant_info(tenant_id: str, _: bool = Depends(auth_admin)):
+    """Get tenant information (admin only)"""
     return get_tenant(tenant_id)
 
 @app.patch("/auth/tenants/{tenant_id}", response_model=TenantResponse)
-def update_tenant(tenant_id: str, max_cpu: int = None, max_memory_gi: int = None, max_concurrent_jobs: int = None):
-    """Update tenant resource limits"""
+def update_tenant(tenant_id: str, max_cpu: int = None, max_memory_gi: int = None, max_concurrent_jobs: int = None, _: bool = Depends(auth_admin)):
+    """Update tenant resource limits (admin only)"""
     tenant = update_tenant_limits(tenant_id, max_cpu, max_memory_gi, max_concurrent_jobs)
     # Update K8s resources
     ensure_tenant_namespace(tenant)

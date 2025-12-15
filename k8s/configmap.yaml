@@ -12,4 +12,7 @@ data:
   DB_POOL_MIN: "2"
   DB_POOL_MAX: "10"
   CORS_ORIGINS: "*"
+  RESULT_STORAGE_TYPE: "s3"
+  S3_BUCKET: "transcality-simulations"
+  S3_REGION: "eu-central-2"
 

@@ -1,3 +1,4 @@
+# PostgreSQL PersistentVolumeClaim
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -6,10 +7,14 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: ebs-gp3  # EBS CSI driver storage class (Kubernetes 1.32+ compatible)
   resources:
     requests:
       storage: 10Gi
 ---
+# PostgreSQL Deployment
+# Runs on INFRASTRUCTURE nodes (t3.large, always-on instances)
+# Infrastructure nodes: t3.large (8GB RAM) - for controller, postgres, and other system components
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -25,6 +30,9 @@ spec:
       labels:
         app: postgres
     spec:
+      # Schedule on infrastructure nodes (t3.large, 8GB RAM)
+      nodeSelector:
+        node-type: infrastructure
       containers:
       - name: postgres
         image: postgres:14-alpine
@@ -39,6 +47,8 @@ spec:
               name: sumo-k8-secrets
               key: POSTGRES_PASSWORD
               optional: true
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         ports:
         - containerPort: 5432
         volumeMounts:
@@ -47,7 +57,7 @@ spec:
         resources:
           requests:
             cpu: "100m"
-            memory: "256Mi"
+            memory: "256Mi"  # For t3.large infrastructure node (8GB RAM)
           limits:
             cpu: "500m"
             memory: "512Mi"
