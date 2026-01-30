@@ -382,6 +382,166 @@ def cluster_activity():
     }
 
 # ============================================================================
+# Cluster Warmup Endpoint
+# ============================================================================
+
+@app.post("/admin/warmup")
+def warmup_cluster(cpu_request: int = 2, memory_gi: int = 4, keep_alive_seconds: int = 300):
+    """
+    Pre-warm the cluster by spinning up a simulation node and pulling the SUMO image.
+    
+    - cpu_request: CPU cores for the warmup pod (determines node size)
+    - memory_gi: Memory in GB for the warmup pod
+    - keep_alive_seconds: How long to keep the warmup pod running (default 5 min)
+    
+    The node will remain available until Karpenter's consolidation kicks in (typically 30s after pod terminates).
+    """
+    if not k8s_available:
+        raise HTTPException(status_code=503, detail="Kubernetes not available")
+    
+    from kubernetes import client
+    from src.k8s_client import k8s_core, k8s_batch
+    from src.config import SUMO_IMAGE
+    import uuid
+    
+    warmup_id = str(uuid.uuid4())[:8]
+    job_name = f"warmup-{warmup_id}"
+    namespace = "sumo-k8"  # Use controller namespace for warmup jobs
+    
+    # Ensure namespace exists
+    try:
+        k8s_core.read_namespace(namespace)
+    except:
+        pass
+    
+    # Create warmup job that pulls image and stays alive briefly
+    warmup_script = f"""#!/bin/sh
+echo "Warmup started - pulling image and keeping node warm"
+echo "SUMO image: {SUMO_IMAGE}"
+echo "Keep alive for {keep_alive_seconds} seconds..."
+sleep {keep_alive_seconds}
+echo "Warmup complete"
+"""
+    
+    job_manifest = client.V1Job(
+        metadata=client.V1ObjectMeta(
+            name=job_name,
+            namespace=namespace,
+            labels={"app": "sumo-k8-warmup", "warmup-id": warmup_id}
+        ),
+        spec=client.V1JobSpec(
+            ttl_seconds_after_finished=60,  # Auto-cleanup after 1 minute
+            backoff_limit=0,
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(
+                    labels={"app": "sumo-k8-warmup", "warmup-id": warmup_id}
+                ),
+                spec=client.V1PodSpec(
+                    node_selector={"node-type": "simulation"},
+                    containers=[
+                        client.V1Container(
+                            name="warmup",
+                            image=SUMO_IMAGE,
+                            command=["/bin/sh", "-c"],
+                            args=[warmup_script],
+                            resources=client.V1ResourceRequirements(
+                                requests={"cpu": str(cpu_request), "memory": f"{memory_gi}Gi"},
+                                limits={"cpu": str(cpu_request), "memory": f"{memory_gi}Gi"}
+                            )
+                        )
+                    ],
+                    restart_policy="Never"
+                )
+            )
+        )
+    )
+    
+    try:
+        k8s_batch.create_namespaced_job(namespace, job_manifest)
+        logger.info(f"Created warmup job {job_name}")
+        
+        return {
+            "status": "warming_up",
+            "warmup_id": warmup_id,
+            "job_name": job_name,
+            "namespace": namespace,
+            "cpu_request": cpu_request,
+            "memory_gi": memory_gi,
+            "keep_alive_seconds": keep_alive_seconds,
+            "message": f"Warmup job created. Node will spin up and pull image. Pod will stay alive for {keep_alive_seconds}s."
+        }
+    except Exception as e:
+        logger.error(f"Failed to create warmup job: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create warmup job: {str(e)}")
+
+@app.get("/admin/warmup/status")
+def warmup_status():
+    """Check status of warmup jobs"""
+    if not k8s_available:
+        raise HTTPException(status_code=503, detail="Kubernetes not available")
+    
+    from src.k8s_client import k8s_batch, k8s_core
+    
+    namespace = "sumo-k8"
+    warmup_jobs = []
+    
+    try:
+        jobs = k8s_batch.list_namespaced_job(namespace, label_selector="app=sumo-k8-warmup")
+        for job in jobs.items:
+            status = "pending"
+            if job.status.active:
+                status = "running"
+            elif job.status.succeeded:
+                status = "completed"
+            elif job.status.failed:
+                status = "failed"
+            
+            warmup_jobs.append({
+                "name": job.metadata.name,
+                "warmup_id": job.metadata.labels.get("warmup-id"),
+                "status": status,
+                "created_at": job.metadata.creation_timestamp.isoformat() if job.metadata.creation_timestamp else None
+            })
+    except Exception as e:
+        logger.error(f"Failed to list warmup jobs: {e}")
+    
+    # Also check for simulation nodes
+    simulation_nodes = []
+    try:
+        nodes = k8s_core.list_node(label_selector="node-type=simulation")
+        for node in nodes.items:
+            simulation_nodes.append({
+                "name": node.metadata.name,
+                "ready": any(c.type == "Ready" and c.status == "True" for c in node.status.conditions),
+                "created_at": node.metadata.creation_timestamp.isoformat() if node.metadata.creation_timestamp else None
+            })
+    except Exception as e:
+        logger.error(f"Failed to list simulation nodes: {e}")
+    
+    return {
+        "warmup_jobs": warmup_jobs,
+        "simulation_nodes": simulation_nodes,
+        "message": f"{len(simulation_nodes)} simulation node(s) available"
+    }
+
+@app.delete("/admin/warmup/{warmup_id}")
+def cancel_warmup(warmup_id: str):
+    """Cancel a warmup job"""
+    if not k8s_available:
+        raise HTTPException(status_code=503, detail="Kubernetes not available")
+    
+    from src.k8s_client import k8s_batch
+    
+    namespace = "sumo-k8"
+    job_name = f"warmup-{warmup_id}"
+    
+    try:
+        k8s_batch.delete_namespaced_job(job_name, namespace, propagation_policy="Foreground")
+        return {"status": "cancelled", "warmup_id": warmup_id}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Warmup job not found: {str(e)}")
+
+# ============================================================================
 # Startup & Shutdown
 # ============================================================================
 
