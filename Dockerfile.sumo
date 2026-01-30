@@ -1,0 +1,22 @@
+# Custom SUMO image with Apache Arrow/Parquet support
+FROM ghcr.io/eclipse-sumo/sumo:latest
+
+# Install Apache Arrow/Parquet libraries for SUMO output support
+# SUMO is compiled against Arrow 23.0.0 (libparquet.so.2300)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    && curl -fsSL https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr '[:upper:]' '[:lower:]')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb -o /tmp/arrow.deb \
+    && apt-get install -y /tmp/arrow.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libarrow2300 \
+        libparquet2300 \
+    && rm -rf /var/lib/apt/lists/* /tmp/arrow.deb
+
+# Verify SUMO works with Parquet support
+RUN sumo --version
+
+WORKDIR /workspace

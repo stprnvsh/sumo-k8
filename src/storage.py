@@ -31,22 +31,30 @@ def detect_storage_type() -> str:
         # Check node labels/provider IDs
         for node in nodes.items:
             labels = node.metadata.labels or {}
-            provider_id = labels.get("kubernetes.io/hostname", "")
+            provider_id = node.spec.provider_id or ""
+            hostname = labels.get("kubernetes.io/hostname", "")
             
             # GKE detection
-            if "gke" in provider_id.lower() or any("gke" in k.lower() for k in labels.keys()):
+            if "gke" in provider_id.lower() or "gke" in hostname.lower() or any("gke" in k.lower() for k in labels.keys()):
                 if GCS_BUCKET:
                     return "gcs"
                 return "pvc"
             
-            # EKS detection
-            if "eks" in provider_id.lower() or "ec2" in provider_id.lower():
+            # EKS detection - check provider ID, hostname, or EKS-specific labels
+            is_eks = (
+                "aws" in provider_id.lower() or
+                "ec2" in provider_id.lower() or
+                "eks" in provider_id.lower() or
+                any("eks.amazonaws.com" in k for k in labels.keys()) or
+                any("eksctl.io" in k for k in labels.keys())
+            )
+            if is_eks:
                 if S3_BUCKET:
                     return "s3"
                 return "pvc"
             
             # AKS detection
-            if "aks" in provider_id.lower() or any("azure" in k.lower() for k in labels.keys()):
+            if "aks" in provider_id.lower() or "azure" in provider_id.lower() or any("azure" in k.lower() for k in labels.keys()):
                 if AZURE_STORAGE_ACCOUNT and AZURE_CONTAINER:
                     return "azure"
                 return "pvc"
@@ -57,34 +65,12 @@ def detect_storage_type() -> str:
         logger.warning(f"Error detecting storage type: {e}, defaulting to PVC")
         return "pvc"
 
-def get_default_storage_class() -> Optional[str]:
-    """Get the default storage class name"""
-    if not k8s_available:
-        return None
-    try:
-        storage_api = client.StorageV1Api()
-        storage_classes = storage_api.list_storage_class()
-        for sc in storage_classes.items:
-            # Check if it's the default (annotation or common names)
-            annotations = sc.metadata.annotations or {}
-            if annotations.get("storageclass.kubernetes.io/is-default-class") == "true":
-                return sc.metadata.name
-        # Fallback: return first storage class or common defaults
-        if storage_classes.items:
-            return storage_classes.items[0].metadata.name
-        # Common defaults for cloud providers
-        return "ebs-gp3"  # EKS EBS CSI driver (Kubernetes 1.32+ compatible)
-    except Exception as e:
-        logger.warning(f"Error getting storage class: {e}, using default 'ebs-gp3'")
-        return "ebs-gp3"
-
 def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
     """Ensure PVC exists for tenant results storage"""
     if not k8s_available:
         return None
     
     pvc_name = f"results-{tenant_namespace}"
-    storage_class = get_default_storage_class()
     
     try:
         k8s_core.read_namespaced_persistent_volume_claim(pvc_name, tenant_namespace)
@@ -92,22 +78,18 @@ def ensure_tenant_pvc(tenant_namespace: str) -> Optional[str]:
         return pvc_name
     except client.exceptions.ApiException as e:
         if e.status == 404:
-            # Use ReadWriteOnce (works with EBS and most block storage)
-            pvc_spec = client.V1PersistentVolumeClaimSpec(
-                access_modes=["ReadWriteOnce"],
-                resources=client.V1ResourceRequirements(
-                    requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
-                )
-            )
-            if storage_class:
-                pvc_spec.storage_class_name = storage_class
-            
+            # Create PVC
             pvc = client.V1PersistentVolumeClaim(
                 metadata=client.V1ObjectMeta(
                     name=pvc_name,
                     namespace=tenant_namespace
                 ),
-                spec=pvc_spec
+                spec=client.V1PersistentVolumeClaimSpec(
+                    access_modes=["ReadWriteMany"],
+                    resources=client.V1ResourceRequirements(
+                        requests={"storage": f"{RESULT_STORAGE_SIZE_GI}Gi"}
+                    )
+                )
             )
             try:
                 k8s_core.create_namespaced_persistent_volume_claim(tenant_namespace, pvc)
@@ -131,7 +113,7 @@ def upload_to_s3(job_id: str, tenant_id: str, local_path: str) -> Optional[Dict[
         from botocore.exceptions import ClientError
         
         s3_client = boto3.client('s3', region_name=S3_REGION)
-        prefix = f"sumo-k8-results/{tenant_id}/{job_id}/"
+        prefix = f"results/{tenant_id}/{job_id}/"
         
         uploaded_files = []
         
@@ -274,6 +256,35 @@ def upload_to_azure(job_id: str, tenant_id: str, local_path: str) -> Optional[Di
         logger.error(f"Failed to upload to Azure: {e}")
         return None
 
+def list_s3_files(prefix: str) -> List[Dict]:
+    """List files in S3 under a prefix"""
+    if not S3_BUCKET:
+        return []
+    
+    try:
+        import boto3
+        s3_client = boto3.client('s3', region_name=S3_REGION)
+        
+        files = []
+        paginator = s3_client.get_paginator('list_objects_v2')
+        
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                # Get just the filename (remove prefix)
+                name = key[len(prefix):] if key.startswith(prefix) else key
+                if name:  # Skip the prefix itself
+                    files.append({
+                        "name": name,
+                        "url": f"s3://{S3_BUCKET}/{key}",
+                        "size": obj['Size']
+                    })
+        
+        return files
+    except Exception as e:
+        logger.error(f"Failed to list S3 files: {e}")
+        return []
+
 def upload_results_from_pvc(job_id: str, tenant_id: str, tenant_namespace: str, storage_type: str) -> Optional[Dict]:
     """Create a temporary pod to upload results from PVC to object storage"""
     if storage_type not in ("s3", "gcs", "azure"):
@@ -300,7 +311,7 @@ from pathlib import Path
 
 s3 = boto3.client('s3', region_name='{S3_REGION}')
 bucket = '{S3_BUCKET}'
-prefix = 'sumo-k8-results/{tenant_id}/{job_id}/'
+prefix = 'results/{tenant_id}/{job_id}/'
 results_dir = Path('/results/{job_id}')
 
 if not results_dir.exists():
@@ -598,7 +609,7 @@ def get_result_storage_info(job_id: str, tenant_namespace: str, storage_type: st
         return {
             "storage_type": "s3",
             "bucket": S3_BUCKET,
-            "prefix": f"sumo-k8-results/{tenant_namespace}/{job_id}/"
+            "prefix": f"results/{tenant_namespace}/{job_id}/"
         }
     elif storage_type == "gcs":
         return {

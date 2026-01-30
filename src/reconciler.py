@@ -6,7 +6,7 @@ from kubernetes import client
 from .database import get_db
 from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
-from .storage import detect_storage_type, get_result_storage_info, upload_results_from_pvc
+from .storage import detect_storage_type, get_result_storage_info, upload_results_from_pvc, list_s3_files
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
@@ -135,14 +135,21 @@ def sync_job_status():
                         upload_job = k8s_batch.read_namespaced_job(upload_job_name, job['k8s_namespace'])
                         
                         if upload_job.status.succeeded:
-                            # Upload completed, get storage info
+                            # Upload completed, get storage info and list files
                             storage_type = detect_storage_type()
                             storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
-                            # For now, just mark as uploaded (files list would need to be extracted from upload job logs)
+                            prefix = storage_info.get("prefix", "")
+                            
+                            # List actual files from storage
+                            files = []
+                            if storage_type == "s3" and prefix:
+                                files = list_s3_files(prefix)
+                            
                             result_files = Json({
                                 "storage_type": storage_type,
                                 "uploaded": True,
-                                "prefix": storage_info.get("prefix", "")
+                                "prefix": prefix,
+                                "files": files
                             })
                             
                             update_cur = conn.cursor()
@@ -160,7 +167,29 @@ def sync_job_status():
                                 from .storage import cleanup_pvc_after_upload
                                 cleanup_pvc_after_upload(job['k8s_namespace'], str(job['job_id']))
                     except client.exceptions.ApiException as e:
-                        if e.status != 404:
+                        if e.status == 404:
+                            # Upload job doesn't exist (already cleaned up), try to list files directly from S3
+                            storage_type = detect_storage_type()
+                            if storage_type == "s3":
+                                storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
+                                prefix = storage_info.get("prefix", "")
+                                files = list_s3_files(prefix) if prefix else []
+                                
+                                if files:  # Only update if files exist in S3
+                                    result_files = Json({
+                                        "storage_type": storage_type,
+                                        "uploaded": True,
+                                        "prefix": prefix,
+                                        "files": files
+                                    })
+                                    update_cur = conn.cursor()
+                                    update_cur.execute(
+                                        """UPDATE jobs SET result_files = %s WHERE job_id = %s""",
+                                        (result_files, job['job_id'])
+                                    )
+                                    conn.commit()
+                                    logger.info(f"Updated result_files for job {job['job_id']} from S3 listing")
+                        else:
                             logger.debug(f"Could not check upload job for {job['job_id']}: {e}")
                     except Exception as e:
                         logger.debug(f"Could not update result_files for {job['job_id']}: {e}")

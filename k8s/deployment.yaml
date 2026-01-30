@@ -1,6 +1,3 @@
-# SUMO-K8 Controller Deployment
-# Runs on INFRASTRUCTURE nodes (always-on, cost-effective instances)
-# Deploy script will replace IMAGE_PLACEHOLDER with actual image
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -19,12 +16,9 @@ spec:
         app: sumo-k8-controller
     spec:
       serviceAccountName: sumo-k8-controller
-      # Schedule on infrastructure nodes
-      nodeSelector:
-        node-type: infrastructure
       containers:
       - name: app
-        image: IMAGE_PLACEHOLDER
+        image: 154794777636.dkr.ecr.eu-central-2.amazonaws.com/sumo-k8-controller:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8000
@@ -35,12 +29,6 @@ spec:
             secretKeyRef:
               name: sumo-k8-secrets
               key: DATABASE_URL
-        - name: ADMIN_KEY
-          valueFrom:
-            secretKeyRef:
-              name: sumo-k8-secrets
-              key: ADMIN_KEY
-              optional: true
         envFrom:
         - configMapRef:
             name: sumo-k8-config

@@ -41,3 +41,6 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 AZURE_STORAGE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT", "")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "")
 
+# SUMO simulation image
+SUMO_IMAGE = os.getenv("SUMO_IMAGE", "ghcr.io/eclipse-sumo/sumo:latest")
+

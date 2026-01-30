@@ -10,7 +10,7 @@ from kubernetes import client
 from .database import get_db
 from .k8s_client import k8s_available, k8s_core, k8s_batch
 from .scaling import ensure_tenant_namespace, cleanup_configmaps
-from .config import MAX_FILE_SIZE_MB, MAX_JOB_DURATION_HOURS
+from .config import MAX_FILE_SIZE_MB, MAX_JOB_DURATION_HOURS, SUMO_IMAGE
 from .storage import detect_storage_type
 from psycopg2.extras import Json
 
@@ -283,7 +283,7 @@ fi
                     containers=[
                         client.V1Container(
                             name="sumo",
-                            image="ghcr.io/eclipse-sumo/sumo:latest",
+                            image=SUMO_IMAGE,
                             command=["/bin/sh", "-c"],
                             args=[run_script],
                             resources=client.V1ResourceRequirements(
