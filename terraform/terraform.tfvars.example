@@ -19,10 +19,9 @@ infrastructure_node_type = "t3.large"
 infrastructure_min_size = 1
 infrastructure_max_size = 3
 
-# Simulation nodes (Karpenter)
-simulation_instance_types = ["c5.4xlarge", "c7i.4xlarge", "c7i.8xlarge", "c5.9xlarge"]
-simulation_max_cpu = "200"
-simulation_max_memory = "1600Gi"
+# Simulation nodes (Karpenter NodePool limits; shape rules are in modules/karpenter/main.tf)
+simulation_max_cpu = "6000"
+simulation_max_memory = "6000Gi"
 
 # Application
 image_repository_name = "sumo-k8-controller"

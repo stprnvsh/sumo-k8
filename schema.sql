@@ -7,9 +7,9 @@ CREATE TABLE tenants (
   tenant_id TEXT PRIMARY KEY,
   namespace TEXT UNIQUE NOT NULL,
   api_key TEXT UNIQUE NOT NULL,
-  max_cpu INT DEFAULT 10 CHECK (max_cpu > 0 AND max_cpu <= 100),
-  max_memory_gi INT DEFAULT 20 CHECK (max_memory_gi > 0 AND max_memory_gi <= 500),
-  max_concurrent_jobs INT DEFAULT 2 CHECK (max_concurrent_jobs > 0 AND max_concurrent_jobs <= 50),
+  max_cpu INT DEFAULT 10 CHECK (max_cpu > 0 AND max_cpu <= 1000),
+  max_memory_gi INT DEFAULT 20 CHECK (max_memory_gi > 0 AND max_memory_gi <= 5000),
+  max_concurrent_jobs INT DEFAULT 2 CHECK (max_concurrent_jobs > 0 AND max_concurrent_jobs <= 200),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -20,7 +20,7 @@ CREATE TABLE jobs (
   tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
   k8s_job_name TEXT NOT NULL,
   k8s_namespace TEXT NOT NULL,
-  status TEXT DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')),
+  status TEXT DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')),
   submitted_at TIMESTAMPTZ DEFAULT NOW(),
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,

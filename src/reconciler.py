@@ -6,10 +6,66 @@ from kubernetes import client
 from .database import get_db
 from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
-from .storage import detect_storage_type, get_result_storage_info, upload_results_from_pvc, list_s3_files
+from .jobs import dispatch_queued_jobs
+from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
+
+def _extract_failure_info(namespace: str, k8s_job_name: str):
+    """Best-effort failure diagnostics to persist in DB."""
+    info = {}
+    try:
+        pods = k8s_core.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"job-name={k8s_job_name}",
+        )
+        if not pods.items:
+            return info
+        pod = pods.items[0]
+        pod_name = pod.metadata.name
+        info["pod_name"] = pod_name
+
+        # Capture first terminated state from main container, if present.
+        if pod.status and pod.status.container_statuses:
+            for cs in pod.status.container_statuses:
+                term = cs.state.terminated if cs.state else None
+                if term:
+                    if term.reason:
+                        info["pod_reason"] = term.reason
+                    if term.message:
+                        info["pod_message"] = term.message[:2000]
+                    break
+
+        try:
+            logs = k8s_core.read_namespaced_pod_log(
+                name=pod_name,
+                namespace=namespace,
+                tail_lines=120,
+            )
+            if logs:
+                info["log_tail"] = logs[-4000:]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return info
+
+
+def _job_pod_phase_running(namespace: str, k8s_job_name: str) -> bool:
+    """True if any Job pod exists and is in phase Running (not Pending/Succeeded/Failed)."""
+    try:
+        pods = k8s_core.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"job-name={k8s_job_name}",
+        )
+        for pod in pods.items:
+            if pod.status and pod.status.phase == "Running":
+                return True
+        return False
+    except Exception:
+        return False
+
 
 def sync_job_status():
     """Background reconciler to sync K8s job status with database"""
@@ -19,14 +75,18 @@ def sync_job_status():
             continue
             
         try:
+            dispatch_queued_jobs()
             with get_db() as conn:
                 cur = conn.cursor()
+                storage_type = detect_storage_type()
                 # First, backfill missing timestamps for completed jobs
                 cur.execute(
                     """SELECT job_id, k8s_job_name, k8s_namespace, status, started_at, finished_at
                        FROM jobs 
                        WHERE status IN ('SUCCEEDED', 'FAILED') 
-                       AND (started_at IS NULL OR finished_at IS NULL)"""
+                       AND (started_at IS NULL OR finished_at IS NULL)
+                       ORDER BY submitted_at DESC
+                       LIMIT 100"""
                 )
                 completed_jobs = cur.fetchall()
                 for job in completed_jobs:
@@ -79,26 +139,27 @@ def sync_job_status():
                 cur.execute(
                     """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id
                        FROM jobs 
-                       WHERE status IN ('SUCCEEDED', 'FAILED') 
-                       AND result_location IS NULL"""
+                       WHERE status = 'SUCCEEDED'
+                       AND result_location IS NULL
+                       ORDER BY submitted_at DESC
+                       LIMIT 50"""
                 )
                 missing_results = cur.fetchall()
                 for job in missing_results:
                     try:
-                        storage_type = detect_storage_type()
                         storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
                         
                         if job['status'] == 'SUCCEEDED':
-                            # Trigger upload for cloud storage if not already done
-                            if storage_type in ("s3", "gcs", "azure"):
-                                upload_result = upload_results_from_pvc(
-                                    str(job['job_id']), 
-                                    job['tenant_id'], 
-                                    job['k8s_namespace'], 
-                                    storage_type
-                                )
-                                result_location = storage_info.get("prefix", "")
-                                result_files = None
+                            # Keep reconciler lightweight: avoid listing all S3 files here.
+                            # The results API can still use prefix-based discovery if needed.
+                            if storage_type == "s3":
+                                prefix = storage_info.get("prefix", "")
+                                result_location = prefix
+                                result_files = Json({
+                                    "storage_type": "s3",
+                                    "uploaded": True,
+                                    "prefix": prefix,
+                                })
                             else:
                                 result_location = storage_info.get("path", "")
                                 result_files = None
@@ -118,85 +179,86 @@ def sync_job_status():
                     except Exception as e:
                         logger.debug(f"Could not backfill result_location for {job['job_id']}: {e}")
                 
-                # Check for completed upload jobs and update result_files
+                # Check for jobs with missing result_files and backfill from S3
                 cur.execute(
-                    """SELECT job_id, k8s_namespace, tenant_id, result_files
+                    """SELECT job_id, k8s_namespace, tenant_id
                        FROM jobs 
                        WHERE status = 'SUCCEEDED' 
                        AND result_files IS NULL
                        AND result_location IS NOT NULL
-                       AND result_location LIKE '%results/%'"""
+                       ORDER BY submitted_at DESC
+                       LIMIT 50"""
                 )
-                pending_uploads = cur.fetchall()
-                for job in pending_uploads:
+                pending_results = cur.fetchall()
+                for job in pending_results:
                     try:
-                        # Check if upload job completed
-                        upload_job_name = f"upload-{str(job['job_id'])[:8]}"
-                        upload_job = k8s_batch.read_namespaced_job(upload_job_name, job['k8s_namespace'])
-                        
-                        if upload_job.status.succeeded:
-                            # Upload completed, get storage info and list files
-                            storage_type = detect_storage_type()
+                        if storage_type == "s3":
                             storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
                             prefix = storage_info.get("prefix", "")
-                            
-                            # List actual files from storage
-                            files = []
-                            if storage_type == "s3" and prefix:
-                                files = list_s3_files(prefix)
-                            
                             result_files = Json({
-                                "storage_type": storage_type,
+                                "storage_type": "s3",
                                 "uploaded": True,
                                 "prefix": prefix,
-                                "files": files
                             })
-                            
                             update_cur = conn.cursor()
                             update_cur.execute(
-                                """UPDATE jobs 
-                                   SET result_files = %s
-                                   WHERE job_id = %s""",
+                                """UPDATE jobs SET result_files = %s WHERE job_id = %s""",
                                 (result_files, job['job_id'])
                             )
                             conn.commit()
-                            logger.info(f"Updated result_files for job {job['job_id']} after upload completion")
-                            
-                            # Clean up PVC after successful cloud storage upload
-                            if storage_type in ("s3", "gcs", "azure"):
-                                from .storage import cleanup_pvc_after_upload
-                                cleanup_pvc_after_upload(job['k8s_namespace'], str(job['job_id']))
-                    except client.exceptions.ApiException as e:
-                        if e.status == 404:
-                            # Upload job doesn't exist (already cleaned up), try to list files directly from S3
-                            storage_type = detect_storage_type()
-                            if storage_type == "s3":
-                                storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
-                                prefix = storage_info.get("prefix", "")
-                                files = list_s3_files(prefix) if prefix else []
-                                
-                                if files:  # Only update if files exist in S3
-                                    result_files = Json({
-                                        "storage_type": storage_type,
+                            logger.info(f"Backfilled result_files for job {job['job_id']}")
+                    except Exception as e:
+                        logger.debug(f"Could not backfill result_files for {job['job_id']}: {e}")
+
+                # Repair jobs incorrectly marked FAILED when K8s Job was already GC'd
+                # but direct S3 upload completed successfully.
+                if storage_type == "s3":
+                    cur.execute(
+                        """SELECT job_id, k8s_namespace
+                           FROM jobs
+                           WHERE status = 'FAILED'
+                           AND result_location IS NULL
+                           ORDER BY submitted_at DESC
+                           LIMIT 50"""
+                    )
+                    failed_jobs = cur.fetchall()
+                    for job in failed_jobs:
+                        try:
+                            storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
+                            prefix = storage_info.get("prefix", "")
+                            if not prefix or not s3_prefix_has_files(prefix):
+                                continue
+                            update_cur = conn.cursor()
+                            update_cur.execute(
+                                """UPDATE jobs
+                                   SET status = 'SUCCEEDED',
+                                       result_location = %s,
+                                       result_files = %s,
+                                       finished_at = COALESCE(finished_at, NOW()),
+                                       started_at = COALESCE(started_at, NOW())
+                                   WHERE job_id = %s""",
+                                (
+                                    prefix,
+                                    Json({
+                                        "storage_type": "s3",
                                         "uploaded": True,
                                         "prefix": prefix,
-                                        "files": files
-                                    })
-                                    update_cur = conn.cursor()
-                                    update_cur.execute(
-                                        """UPDATE jobs SET result_files = %s WHERE job_id = %s""",
-                                        (result_files, job['job_id'])
-                                    )
-                                    conn.commit()
-                                    logger.info(f"Updated result_files for job {job['job_id']} from S3 listing")
-                        else:
-                            logger.debug(f"Could not check upload job for {job['job_id']}: {e}")
-                    except Exception as e:
-                        logger.debug(f"Could not update result_files for {job['job_id']}: {e}")
+                                    }),
+                                    job['job_id'],
+                                )
+                            )
+                            conn.commit()
+                            logger.info(f"Repaired FAILED->SUCCEEDED for job {job['job_id']} based on S3 results")
+                        except Exception as e:
+                            logger.debug(f"Could not repair failed job {job['job_id']}: {e}")
                 
                 # Then process active jobs
                 cur.execute(
-                    "SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id FROM jobs WHERE status IN ('PENDING', 'RUNNING')"
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id
+                       FROM jobs
+                       WHERE status IN ('PENDING', 'RUNNING')
+                       ORDER BY submitted_at DESC
+                       LIMIT 200"""
                 )
                 jobs = cur.fetchall()
                 
@@ -213,10 +275,16 @@ def sync_job_status():
                                 elif cond.type == "Complete" and cond.status == "True":
                                     new_status = "SUCCEEDED"
                                     break
-                        
-                        if k8s_job.status.active and job['status'] == 'PENDING':
+
+                        running_pod = _job_pod_phase_running(
+                            job["k8s_namespace"], job["k8s_job_name"]
+                        )
+                        # Job.status.active counts uncompleted pods including Pending; use pod phase Running.
+                        if new_status == "PENDING" and running_pod:
                             new_status = "RUNNING"
-                        
+                        elif new_status == "RUNNING" and not running_pod:
+                            new_status = "PENDING"
+
                         if new_status != job['status']:
                             update_cur = conn.cursor()
                             if new_status == "RUNNING":
@@ -224,38 +292,38 @@ def sync_job_status():
                                     "UPDATE jobs SET status = %s, started_at = NOW() WHERE job_id = %s",
                                     (new_status, job['job_id'])
                                 )
+                            elif new_status == "PENDING" and job["status"] == "RUNNING":
+                                update_cur.execute(
+                                    "UPDATE jobs SET status = %s, started_at = NULL WHERE job_id = %s",
+                                    (new_status, job['job_id'])
+                                )
                             elif new_status in ("SUCCEEDED", "FAILED"):
-                                # Set started_at if not already set (job might have completed very quickly)
                                 # Store result location info
-                                storage_type = detect_storage_type()
-                                # Use k8s_namespace (which matches tenant namespace) for storage path
                                 storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
                                 
                                 if new_status == "SUCCEEDED":
-                                    # For cloud storage, trigger upload job
-                                    if storage_type in ("s3", "gcs", "azure"):
-                                        upload_result = upload_results_from_pvc(
-                                            str(job['job_id']), 
-                                            job['tenant_id'], 
-                                            job['k8s_namespace'], 
-                                            storage_type
-                                        )
-                                        if upload_result:
-                                            logger.info(f"Started upload job for {job['job_id']} to {storage_type}")
-                                            # Store prefix for now, upload job will update result_files when done
-                                            result_location = storage_info.get("prefix", "")
-                                            result_files = None  # Will be updated by upload job completion
-                                        else:
-                                            # Upload failed, fall back to PVC info
-                                            result_location = storage_info.get("path", "")
-                                            result_files = None
+                                    # Direct S3 upload: keep metadata lightweight in reconciler.
+                                    if storage_type == "s3":
+                                        prefix = storage_info.get("prefix", "")
+                                        result_location = prefix
+                                        result_files = Json({
+                                            "storage_type": "s3",
+                                            "uploaded": True,
+                                            "prefix": prefix,
+                                        })
+                                        logger.info(f"Job {job['job_id']} completed; S3 prefix set")
                                     else:
-                                        # PVC storage
                                         result_location = storage_info.get("path", "")
                                         result_files = None
                                 else:
                                     result_location = None
-                                    result_files = None
+                                    failure = _extract_failure_info(job['k8s_namespace'], job['k8s_job_name'])
+                                    result_files = Json({
+                                        "storage_type": storage_type,
+                                        "uploaded": False,
+                                        "error_message": failure.get("pod_reason", "Job failed"),
+                                        "failure": failure,
+                                    })
                                 
                                 update_cur.execute(
                                     """UPDATE jobs 
@@ -278,14 +346,42 @@ def sync_job_status():
                             logger.info(f"Updated job {job['job_id']} status: {job['status']} -> {new_status}")
                     except client.exceptions.ApiException as e:
                         if e.status == 404:
-                            # Job doesn't exist in K8s, mark as failed
+                            # If the K8s Job has already been deleted but results exist in S3,
+                            # preserve correct terminal state as SUCCEEDED.
+                            new_status = "FAILED"
+                            result_location = None
+                            failure = _extract_failure_info(job['k8s_namespace'], job['k8s_job_name'])
+                            result_files = Json({
+                                "storage_type": storage_type,
+                                "uploaded": False,
+                                "error_message": failure.get("pod_reason", "K8s job not found after submission"),
+                                "failure": failure,
+                            })
+                            if storage_type == "s3":
+                                storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
+                                prefix = storage_info.get("prefix", "")
+                                if prefix and s3_prefix_has_files(prefix):
+                                    new_status = "SUCCEEDED"
+                                    result_location = prefix
+                                    result_files = Json({
+                                        "storage_type": "s3",
+                                        "uploaded": True,
+                                        "prefix": prefix,
+                                    })
+
                             update_cur = conn.cursor()
                             update_cur.execute(
-                                "UPDATE jobs SET status = 'FAILED', finished_at = NOW() WHERE job_id = %s",
-                                (job['job_id'],)
+                                """UPDATE jobs
+                                   SET status = %s,
+                                       finished_at = NOW(),
+                                       started_at = COALESCE(started_at, NOW()),
+                                       result_location = COALESCE(%s, result_location),
+                                       result_files = COALESCE(%s, result_files)
+                                   WHERE job_id = %s""",
+                                (new_status, result_location, result_files, job['job_id'])
                             )
                             conn.commit()
-                            logger.warning(f"Job {job['job_id']} not found in K8s, marked as FAILED")
+                            logger.warning(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
                         else:
                             logger.error(f"Failed to sync job {job['job_id']}: {e}")
                     except Exception as e:
@@ -311,22 +407,62 @@ def cleanup_old_configmaps():
                     continue
                 
                 try:
-                    configmaps = k8s_core.list_namespaced_config_map(ns.metadata.name)
-                    for cm in configmaps.items:
-                        if cm.metadata.labels and cm.metadata.labels.get('cleanup') == 'true':
-                            age = datetime.now() - cm.metadata.creation_timestamp.replace(tzinfo=None)
-                            if age > timedelta(hours=1):
-                                job_id = cm.metadata.labels.get('job-id')
-                                if job_id:
-                                    with get_db() as conn:
-                                        cur = conn.cursor()
-                                        cur.execute("SELECT job_id FROM jobs WHERE job_id = %s", (job_id,))
-                                        if not cur.fetchone():
-                                            try:
-                                                k8s_core.delete_namespaced_config_map(cm.metadata.name, ns.metadata.name)
-                                                logger.info(f"Cleaned up orphaned ConfigMap {cm.metadata.name}")
-                                            except:
-                                                pass
+                    # Avoid loading all ConfigMaps (which may include large chunk payloads).
+                    # We only need cleanup-marked ConfigMaps.
+                    candidates = []
+                    continue_token = None
+                    while True:
+                        configmaps = k8s_core.list_namespaced_config_map(
+                            ns.metadata.name,
+                            label_selector="cleanup=true",
+                            limit=100,
+                            _continue=continue_token,
+                        )
+                        now = datetime.now()
+                        for cm in configmaps.items:
+                            labels = cm.metadata.labels or {}
+                            if labels.get('cleanup') != 'true':
+                                continue
+                            created_at = cm.metadata.creation_timestamp
+                            if not created_at:
+                                continue
+                            age = now - created_at.replace(tzinfo=None)
+                            if age <= timedelta(hours=1):
+                                continue
+                            job_id = labels.get('job-id')
+                            if not job_id:
+                                continue
+                            candidates.append((cm.metadata.name, job_id))
+
+                        continue_token = configmaps.metadata._continue
+                        if not continue_token:
+                            break
+
+                    if not candidates:
+                        continue
+
+                    job_ids = list({job_id for _, job_id in candidates})
+                    existing_job_ids = set()
+                    with get_db() as conn:
+                        cur = conn.cursor()
+                        placeholders = ", ".join(["%s"] * len(job_ids))
+                        cur.execute(
+                            f"SELECT job_id::text FROM jobs WHERE job_id IN ({placeholders})",
+                            tuple(job_ids),
+                        )
+                        existing_job_ids = {row[0] for row in cur.fetchall()}
+
+                    for cm_name, job_id in candidates:
+                        if job_id in existing_job_ids:
+                            continue
+                        try:
+                            k8s_core.delete_namespaced_config_map(cm_name, ns.metadata.name)
+                            logger.info(f"Cleaned up orphaned ConfigMap {cm_name}")
+                        except client.exceptions.ApiException as e:
+                            if e.status != 404:
+                                logger.debug(f"Failed deleting ConfigMap {cm_name}: {e}")
+                        except Exception as e:
+                            logger.debug(f"Failed deleting ConfigMap {cm_name}: {e}")
                 except Exception as e:
                     logger.debug(f"Error cleaning ConfigMaps in {ns.metadata.name}: {e}")
         except Exception as e:

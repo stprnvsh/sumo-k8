@@ -63,10 +63,9 @@ module "karpenter" {
   cluster_id       = module.eks.cluster_id
   oidc_arn         = module.eks.oidc_provider_arn
   
-  simulation_instance_types = var.simulation_instance_types
-  simulation_max_cpu        = var.simulation_max_cpu
-  simulation_max_memory     = var.simulation_max_memory
-  
+  simulation_max_cpu    = var.simulation_max_cpu
+  simulation_max_memory = var.simulation_max_memory
+
   tags = var.tags
   
   depends_on = [module.eks, module.vpc]

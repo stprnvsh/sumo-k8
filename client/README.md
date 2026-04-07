@@ -5,11 +5,19 @@ A Python client for the SUMO-K8 Kubernetes simulation controller.
 ## Installation
 
 ```bash
-# From the sumo-k8 directory
+# From the sumo-k8 directory (editable install)
 pip install -e ./client
 
 # Or install dependencies directly
 pip install requests
+```
+
+### Install from a Git repo (recommended for other machines)
+
+If `sumo-k8` is in a git repository, you can install the client subdirectory directly:
+
+```bash
+pip install "git+https://github.com/transcality/sumo-k8.git#subdirectory=client"
 ```
 
 ## Quick Start
@@ -19,7 +27,7 @@ from sumo_k8_client import SumoK8Client
 
 # Initialize client
 client = SumoK8Client(
-    base_url="http://your-cluster-url:8000",
+    base_url="http://your-load-balancer-url",
     api_key="sk_your_api_key"
 )
 

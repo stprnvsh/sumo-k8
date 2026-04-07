@@ -6,6 +6,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  storageClassName: ebs-gp3
   resources:
     requests:
       storage: 10Gi
@@ -25,6 +26,8 @@ spec:
       labels:
         app: postgres
     spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: infrastructure-nodes
       containers:
       - name: postgres
         image: postgres:14-alpine
@@ -39,6 +42,8 @@ spec:
               name: sumo-k8-secrets
               key: POSTGRES_PASSWORD
               optional: true
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         ports:
         - containerPort: 5432
         volumeMounts:

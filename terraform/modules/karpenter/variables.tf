@@ -18,11 +18,6 @@ variable "oidc_arn" {
   type = string
 }
 
-variable "simulation_instance_types" {
-  type    = list(string)
-  default = ["c5.4xlarge", "c7i.4xlarge", "c7i.8xlarge", "c5.9xlarge"]
-}
-
 variable "simulation_max_cpu" {
   type    = string
   default = "200"

@@ -1,4 +1,4 @@
-# Custom SUMO image with Apache Arrow/Parquet support
+# Custom SUMO image with Apache Arrow/Parquet support and S3 upload
 FROM ghcr.io/eclipse-sumo/sumo:latest
 
 # Install Apache Arrow/Parquet libraries for SUMO output support
@@ -8,13 +8,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gnupg \
     lsb-release \
+    python3-pip \
+    unzip \
     && curl -fsSL https://apache.jfrog.io/artifactory/arrow/$(lsb_release --id --short | tr '[:upper:]' '[:lower:]')/apache-arrow-apt-source-latest-$(lsb_release --codename --short).deb -o /tmp/arrow.deb \
     && apt-get install -y /tmp/arrow.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         libarrow2300 \
         libparquet2300 \
+    && pip3 install --no-cache-dir boto3 \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow.deb
+
+# Add upload script
+COPY scripts/upload_results.py /scripts/upload_results.py
+RUN chmod +x /scripts/upload_results.py
 
 # Verify SUMO works with Parquet support
 RUN sumo --version

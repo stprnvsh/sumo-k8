@@ -2,7 +2,7 @@
 import logging
 from kubernetes import client
 from .k8s_client import k8s_available, k8s_core, k8s_batch
-from .config import CONFIGMAP_CLEANUP_DELAY_SECONDS, RESULT_STORAGE_SIZE_GI
+from .config import CONFIGMAP_CLEANUP_DELAY_SECONDS, RESULT_STORAGE_SIZE_GI, S3_IAM_ROLE_ARN
 import threading
 import time
 
@@ -114,12 +114,38 @@ def ensure_tenant_namespace(tenant):
             k8s_core.create_namespaced_limit_range(ns_name, limit_range)
             logger.info(f"Created LimitRange {limitrange_name}")
     
-    # Always ensure PVC exists (even for cloud storage, we write to PVC first then upload)
+    # Ensure service account with IRSA for S3 access
     from .storage import detect_storage_type
     storage_type = detect_storage_type()
     logger.info(f"Detected storage type: {storage_type} for namespace {ns_name}")
-    logger.info(f"Creating PVC for namespace {ns_name} (required for result storage)")
-    ensure_tenant_pvc(ns_name)
+    if storage_type == "s3":
+        ensure_simulation_service_account(ns_name)
+
+def ensure_simulation_service_account(tenant_namespace: str):
+    """Ensure service account with IRSA annotation for S3 access exists"""
+    if not k8s_available:
+        return
+    
+    sa_name = "simulation-runner"
+    
+    try:
+        k8s_core.read_namespaced_service_account(sa_name, tenant_namespace)
+        logger.debug(f"ServiceAccount {sa_name} already exists in {tenant_namespace}")
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            annotations = {}
+            if S3_IAM_ROLE_ARN:
+                annotations["eks.amazonaws.com/role-arn"] = S3_IAM_ROLE_ARN
+            
+            sa = client.V1ServiceAccount(
+                metadata=client.V1ObjectMeta(
+                    name=sa_name,
+                    namespace=tenant_namespace,
+                    annotations=annotations if annotations else None
+                )
+            )
+            k8s_core.create_namespaced_service_account(tenant_namespace, sa)
+            logger.info(f"Created ServiceAccount {sa_name} in {tenant_namespace}")
 
 def ensure_tenant_pvc(tenant_namespace: str):
     """Ensure PVC exists for tenant results storage"""

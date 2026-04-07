@@ -4,15 +4,29 @@ import base64
 import zipfile
 import io
 import logging
+import tempfile
+import json
+from pathlib import Path
 from fastapi import HTTPException, UploadFile
-from datetime import datetime
 from kubernetes import client
 from .database import get_db
 from .k8s_client import k8s_available, k8s_core, k8s_batch
 from .scaling import ensure_tenant_namespace, cleanup_configmaps
-from .config import MAX_FILE_SIZE_MB, MAX_JOB_DURATION_HOURS, SUMO_IMAGE
+from .config import (
+    MAX_FILE_SIZE_MB,
+    MAX_JOB_DURATION_HOURS,
+    SUMO_IMAGE,
+    S3_BUCKET,
+    S3_REGION,
+    SIMULATION_NODE_SELECTOR_KEY,
+    SIMULATION_NODE_SELECTOR_VALUES,
+    QUEUE_S3_PREFIX,
+    MAX_QUEUED_JOBS_PER_TENANT,
+)
+import os
 from .storage import detect_storage_type
 from psycopg2.extras import Json
+import boto3
 
 logger = logging.getLogger(__name__)
 
@@ -53,63 +67,301 @@ def validate_and_extract_zip(zip_content: bytes):
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file")
 
-def check_concurrent_jobs(tenant_id: str, max_concurrent: int):
-    """Check if tenant has exceeded concurrent job limit"""
+def validate_and_extract_zip_path(zip_path: str) -> str:
+    """Validate ZIP file on disk and extract SUMO config without loading to memory."""
+    p = Path(zip_path)
+    if not p.exists() or p.stat().st_size == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    zip_size_mb = p.stat().st_size / 1024 / 1024
+    if zip_size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {zip_size_mb:.2f}MB (max: {MAX_FILE_SIZE_MB}MB)"
+        )
+
+    try:
+        with zipfile.ZipFile(zip_path) as zip_file:
+            sumocfg_files = [f for f in zip_file.namelist() if f.endswith(".sumocfg")]
+            if not sumocfg_files:
+                raise HTTPException(status_code=400, detail="No .sumocfg file found in zip")
+            config_file = sumocfg_files[0]
+            logger.info(f"Found SUMO config: {config_file}")
+            return config_file
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid zip file")
+
+async def _save_upload_to_tempfile(upload: UploadFile) -> str:
+    """Stream UploadFile to disk to avoid holding ZIP in memory."""
+    max_bytes = int(MAX_FILE_SIZE_MB) * 1024 * 1024
+    read_size = 1024 * 1024  # 1MiB
+
+    tmp = tempfile.NamedTemporaryFile(prefix="sumo_upload_", suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    total = 0
+    try:
+        while True:
+            chunk = await upload.read(read_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large: {total / 1024 / 1024:.2f}MB (max: {MAX_FILE_SIZE_MB}MB)"
+                )
+            tmp.write(chunk)
+        tmp.flush()
+        return tmp_path
+    except Exception:
+        try:
+            tmp.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            tmp.close()
+        except Exception:
+            pass
+
+def _iter_base64_from_file(file_path: str, read_bytes: int = 1024 * 1024):
+    """Yield base64 text chunks for file content without buffering entire file."""
+    with open(file_path, "rb") as f:
+        leftover = b""
+        while True:
+            data = f.read(read_bytes)
+            if not data:
+                break
+            data = leftover + data
+            n = (len(data) // 3) * 3
+            to_encode = data[:n]
+            leftover = data[n:]
+            if to_encode:
+                yield base64.b64encode(to_encode).decode("ascii")
+        if leftover:
+            yield base64.b64encode(leftover).decode("ascii")
+
+def check_queued_capacity(tenant_id: str):
+    """Reject only when queue is full (submission accepted until then)."""
     with get_db() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) as cnt FROM jobs WHERE tenant_id = %s AND status IN ('PENDING', 'RUNNING')",
-            (tenant_id,)
+            "SELECT COUNT(*) as cnt FROM jobs WHERE tenant_id = %s AND status = 'QUEUED'",
+            (tenant_id,),
         )
-        count = cur.fetchone()['cnt']
-        
-        if count >= max_concurrent:
+        if cur.fetchone()["cnt"] >= MAX_QUEUED_JOBS_PER_TENANT:
             raise HTTPException(
-                status_code=429,
-                detail=f"Too many concurrent jobs ({count}/{max_concurrent})"
+                status_code=503,
+                detail=f"Job queue full ({MAX_QUEUED_JOBS_PER_TENANT} queued); retry later",
             )
 
-def create_k8s_job(tenant: dict, job_id: str, scenario_id: str, 
-                   cpu_request: int, memory_gi: int, zip_b64: str, config_file: str):
+
+def _queue_s3_key(tenant_id: str, job_id: str) -> str:
+    return f"{QUEUE_S3_PREFIX}/{tenant_id}/{job_id}.zip"
+
+
+def _upload_queue_zip_to_s3(local_path: str, tenant_id: str, job_id: str) -> str:
+    if not S3_BUCKET:
+        raise HTTPException(status_code=503, detail="S3 queue storage is not configured")
+    key = _queue_s3_key(tenant_id, job_id)
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    try:
+        s3.upload_file(local_path, S3_BUCKET, key)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to persist queued zip to S3: {e}")
+    return key
+
+
+def _download_queue_zip_from_s3(queue_key: str, job_id: str):
+    if not S3_BUCKET:
+        raise HTTPException(status_code=503, detail="S3 queue storage is not configured")
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    tmp = tempfile.NamedTemporaryFile(prefix=f"queue_{job_id}_", suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        s3.download_file(S3_BUCKET, queue_key, tmp_path)
+        return tmp_path
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to download queued zip from S3: {e}")
+
+
+def _delete_queue_zip_from_s3(queue_key: str):
+    if not S3_BUCKET:
+        return
+    s3 = boto3.client("s3", region_name=S3_REGION)
+    try:
+        s3.delete_object(Bucket=S3_BUCKET, Key=queue_key)
+    except Exception:
+        pass
+
+
+def dispatch_queued_jobs():
+    """Promote QUEUED jobs to K8s when under max_concurrent_jobs (call from reconciler)."""
+    if not k8s_available:
+        return
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT tenant_id FROM jobs WHERE status = 'QUEUED'",
+        )
+        tenant_ids = [r["tenant_id"] for r in cur.fetchall()]
+    for tid in tenant_ids:
+        try:
+            while _dispatch_one_queued(tid):
+                pass
+        except Exception as e:
+            logger.error("dispatch queued for %s: %s", tid, e)
+
+
+def _dispatch_one_queued(tenant_id: str) -> bool:
+    if not k8s_available:
+        return False
+    job_id = None
+    queue_path = None
+    queue_key = None
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT j.* FROM jobs j
+            INNER JOIN tenants t ON t.tenant_id = j.tenant_id
+            WHERE j.tenant_id = %s AND j.status = 'QUEUED'
+            AND (
+              SELECT COUNT(*) FROM jobs j2
+              WHERE j2.tenant_id = j.tenant_id
+              AND j2.status IN ('PENDING', 'RUNNING')
+            ) < t.max_concurrent_jobs
+            ORDER BY j.submitted_at ASC
+            LIMIT 1
+            FOR UPDATE OF j SKIP LOCKED
+            """,
+            (tenant_id,),
+        )
+        job = cur.fetchone()
+        if not job:
+            return False
+        job = dict(job)
+        job_id = str(job["job_id"])
+        cur.execute(
+            "SELECT * FROM tenants WHERE tenant_id = %s",
+            (tenant_id,),
+        )
+        tenant = dict(cur.fetchone())
+        scenario = job["scenario_data"] or {}
+        if isinstance(scenario, str):
+            scenario = json.loads(scenario)
+        scenario_id = scenario.get("scenario_id", "")
+        config_file = scenario.get("config_file", "network.sumocfg")
+        queue_key = scenario.get("queue_s3_key") or _queue_s3_key(tenant_id, job_id)
+        try:
+            queue_path = _download_queue_zip_from_s3(queue_key, job_id)
+        except HTTPException:
+            # Keep QUEUED for retry; do not drop jobs on transient/object-store issues.
+            logger.warning("Queue zip not available yet for %s (%s)", job_id, queue_key)
+            return False
+        zip_size = os.path.getsize(queue_path)
+        ensure_tenant_namespace(tenant)
+        create_k8s_job(
+            tenant,
+            job_id,
+            scenario_id,
+            job["cpu_request"],
+            job["memory_gi"],
+            queue_path,
+            zip_size,
+            config_file,
+        )
+        cur.execute(
+            "UPDATE jobs SET status = 'PENDING' WHERE job_id = %s",
+            (job_id,),
+        )
+    if queue_path and os.path.isfile(queue_path):
+        try:
+            os.unlink(queue_path)
+        except OSError:
+            pass
+    if queue_key:
+        _delete_queue_zip_from_s3(queue_key)
+    return True
+
+def create_k8s_job(
+    tenant: dict,
+    job_id: str,
+    scenario_id: str,
+    cpu_request: int,
+    memory_gi: int,
+    zip_path: str,
+    zip_size_bytes: int,
+    config_file: str,
+):
     """Create Kubernetes Job with SUMO files"""
     if not k8s_available:
         raise HTTPException(status_code=503, detail="Kubernetes not available")
     
     k8s_name = f"sim-{job_id[:8]}"
     max_chunk_size = 900000  # Leave margin under 1MB limit
-    
-    # Handle large files by splitting into ConfigMaps
-    if len(zip_b64) > max_chunk_size:
-        num_chunks = (len(zip_b64) + max_chunk_size - 1) // max_chunk_size
+
+    # Estimate base64 length without encoding entire file in memory.
+    est_b64_len = ((zip_size_bytes + 2) // 3) * 4
+
+    # Handle large files by splitting into ConfigMaps (streaming base64 from disk).
+    if est_b64_len > max_chunk_size:
+        num_chunks = (est_b64_len + max_chunk_size - 1) // max_chunk_size
         configmap_chunks = []
-        
-        for i in range(num_chunks):
-            chunk_name = f"sumo-{job_id[:8]}-chunk{i}"
-            start = i * max_chunk_size
-            end = min((i + 1) * max_chunk_size, len(zip_b64))
-            chunk_data = zip_b64[start:end]
-            
-            configmap = client.V1ConfigMap(
-                metadata=client.V1ObjectMeta(
-                    name=chunk_name,
-                    namespace=tenant['namespace'],
-                    labels={"job-id": job_id, "cleanup": "true"}
-                ),
-                data={"chunk": chunk_data}
-            )
-            try:
-                k8s_core.create_namespaced_config_map(tenant['namespace'], configmap)
+
+        buf = ""
+        chunk_idx = 0
+        try:
+            for b64_part in _iter_base64_from_file(zip_path):
+                buf += b64_part
+                while len(buf) >= max_chunk_size:
+                    chunk_data = buf[:max_chunk_size]
+                    buf = buf[max_chunk_size:]
+
+                    chunk_name = f"sumo-{job_id[:8]}-chunk{chunk_idx}"
+                    chunk_idx += 1
+                    configmap = client.V1ConfigMap(
+                        metadata=client.V1ObjectMeta(
+                            name=chunk_name,
+                            namespace=tenant["namespace"],
+                            labels={"job-id": job_id, "cleanup": "true"},
+                        ),
+                        data={"chunk": chunk_data},
+                    )
+                    k8s_core.create_namespaced_config_map(tenant["namespace"], configmap)
+                    configmap_chunks.append(chunk_name)
+                    logger.info(f"Created ConfigMap chunk {chunk_name} ({len(chunk_data)} bytes)")
+
+            if buf:
+                chunk_name = f"sumo-{job_id[:8]}-chunk{chunk_idx}"
+                configmap = client.V1ConfigMap(
+                    metadata=client.V1ObjectMeta(
+                        name=chunk_name,
+                        namespace=tenant["namespace"],
+                        labels={"job-id": job_id, "cleanup": "true"},
+                    ),
+                    data={"chunk": buf},
+                )
+                k8s_core.create_namespaced_config_map(tenant["namespace"], configmap)
                 configmap_chunks.append(chunk_name)
-                logger.info(f"Created ConfigMap chunk {chunk_name} ({len(chunk_data)} bytes)")
-            except Exception as e:
-                logger.error(f"Failed to create ConfigMap chunk: {e}")
-                # Cleanup already created chunks
-                for cm_name in configmap_chunks:
-                    try:
-                        k8s_core.delete_namespaced_config_map(cm_name, tenant['namespace'])
-                    except:
-                        pass
-                raise HTTPException(status_code=500, detail=f"Failed to store files: {str(e)}")
+                logger.info(f"Created ConfigMap chunk {chunk_name} ({len(buf)} bytes)")
+        except Exception as e:
+            logger.error(f"Failed to create ConfigMap chunks: {e}")
+            for cm_name in configmap_chunks:
+                try:
+                    k8s_core.delete_namespaced_config_map(cm_name, tenant["namespace"])
+                except Exception:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Failed to store files: {str(e)}")
         
         # Build volumes for chunks
         volumes = []
@@ -132,17 +384,11 @@ mkdir -p /workspace
 cd /workspace
 
 echo "Reassembling SUMO files from {num_chunks} chunks..."
-# Sort chunks numerically (chunk0, chunk1, chunk2... not chunk0, chunk1, chunk10...)
 for i in $(seq 0 {num_chunks - 1}); do
     cat /config/chunk$i/chunk >> sumo_files.zip.b64
 done
 base64 -d sumo_files.zip.b64 > sumo_files.zip
 rm sumo_files.zip.b64
-
-if ! command -v unzip >/dev/null 2>&1; then
-    echo "Installing unzip..."
-    apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1 || apk add --no-cache unzip >/dev/null 2>&1 || yum install -y -q unzip >/dev/null 2>&1
-fi
 
 unzip -q sumo_files.zip
 rm sumo_files.zip
@@ -161,19 +407,24 @@ sumo -c "$CONFIG_FILE" || exit 1
 echo "Simulation completed successfully"
 ls -lah
 
-# Copy results to persistent storage (if PVC mounted)
-if [ -d /results ]; then
-    echo "Copying results to persistent storage..."
-    mkdir -p /results/{job_id}
-    cp -r /workspace/*.xml /workspace/*.txt /workspace/*.log /results/{job_id}/ 2>/dev/null || true
-    echo "Results saved to /results/{job_id}/"
-    ls -lah /results/{job_id}/ || true
-fi
+# Upload results to S3
+python3 /scripts/upload_results.py
 """
-        container_env = [client.V1EnvVar(name="SCENARIO_ID", value=scenario_id)]
+        container_env = [
+            client.V1EnvVar(name="SCENARIO_ID", value=scenario_id),
+            client.V1EnvVar(name="JOB_ID", value=job_id),
+            client.V1EnvVar(name="TENANT_ID", value=tenant['tenant_id']),
+        ]
     else:
         # Single ConfigMap for small files
         configmap_name = f"sumo-{job_id[:8]}"
+        zip_b64 = ""
+        try:
+            for part in _iter_base64_from_file(zip_path):
+                zip_b64 += part
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read upload: {str(e)}")
+
         configmap = client.V1ConfigMap(
             metadata=client.V1ObjectMeta(
                 name=configmap_name,
@@ -198,11 +449,6 @@ cd /workspace
 echo "Extracting SUMO files from ConfigMap..."
 cat /config/sumo_files.zip.b64 | base64 -d > sumo_files.zip
 
-if ! command -v unzip >/dev/null 2>&1; then
-    echo "Installing unzip..."
-    apt-get update -qq && apt-get install -y -qq unzip >/dev/null 2>&1 || apk add --no-cache unzip >/dev/null 2>&1 || yum install -y -q unzip >/dev/null 2>&1
-fi
-
 unzip -q sumo_files.zip
 rm sumo_files.zip
 
@@ -220,14 +466,8 @@ sumo -c "$CONFIG_FILE" || exit 1
 echo "Simulation completed successfully"
 ls -lah
 
-# Copy results to persistent storage (if PVC mounted)
-if [ -d /results ]; then
-    echo "Copying results to persistent storage..."
-    mkdir -p /results/{job_id}
-    cp -r /workspace/*.xml /workspace/*.txt /workspace/*.log /results/{job_id}/ 2>/dev/null || true
-    echo "Results saved to /results/{job_id}/"
-    ls -lah /results/{job_id}/ || true
-fi
+# Upload results to S3
+python3 /scripts/upload_results.py
 """
         
         volumes = [
@@ -239,26 +479,49 @@ fi
         volume_mounts = [
             client.V1VolumeMount(name="sumo-files", mount_path="/config")
         ]
-        container_env = [client.V1EnvVar(name="SCENARIO_ID", value=scenario_id)]
+        container_env = [
+            client.V1EnvVar(name="SCENARIO_ID", value=scenario_id),
+            client.V1EnvVar(name="JOB_ID", value=job_id),
+            client.V1EnvVar(name="TENANT_ID", value=tenant['tenant_id']),
+        ]
     
-    # Always mount PVC for result storage (even for cloud, we write to PVC first then upload)
+    # Add S3 environment variables for direct upload
     storage_type = detect_storage_type()
-    pvc_name = f"results-{tenant['namespace']}"
-    volumes.append(
-        client.V1Volume(
-            name="results",
-            persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(
-                claim_name=pvc_name
-            )
-        )
-    )
-    volume_mounts.append(
-        client.V1VolumeMount(
-            name="results",
-            mount_path="/results"
-        )
-    )
+    if storage_type == "s3" and S3_BUCKET:
+        container_env.append(client.V1EnvVar(name="S3_BUCKET", value=S3_BUCKET))
+        container_env.append(client.V1EnvVar(name="S3_REGION", value=S3_REGION))
+        # Pass AWS credentials if available (alternative to IRSA)
+        aws_key = os.getenv("AWS_ACCESS_KEY_ID", "")
+        aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+        if aws_key and aws_secret:
+            container_env.append(client.V1EnvVar(name="AWS_ACCESS_KEY_ID", value=aws_key))
+            container_env.append(client.V1EnvVar(name="AWS_SECRET_ACCESS_KEY", value=aws_secret))
     
+    # Scheduling: allow multiple node selector values via node affinity
+    node_selector = None
+    affinity = None
+    if SIMULATION_NODE_SELECTOR_KEY and SIMULATION_NODE_SELECTOR_VALUES:
+        if len(SIMULATION_NODE_SELECTOR_VALUES) == 1:
+            node_selector = {SIMULATION_NODE_SELECTOR_KEY: SIMULATION_NODE_SELECTOR_VALUES[0]}
+        else:
+            affinity = client.V1Affinity(
+                node_affinity=client.V1NodeAffinity(
+                    required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                        node_selector_terms=[
+                            client.V1NodeSelectorTerm(
+                                match_expressions=[
+                                    client.V1NodeSelectorRequirement(
+                                        key=SIMULATION_NODE_SELECTOR_KEY,
+                                        operator='In',
+                                        values=SIMULATION_NODE_SELECTOR_VALUES,
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                )
+            )
+
     # Create Kubernetes Job
     job_manifest = client.V1Job(
         metadata=client.V1ObjectMeta(
@@ -275,11 +538,10 @@ fi
                     labels={"job-id": job_id, "tenant": tenant['tenant_id']}
                 ),
                 spec=client.V1PodSpec(
-                    # Schedule on simulation nodes (large, on-demand instances)
-                    # Simulation nodes: c5.4xlarge or similar - scale from 0, created on-demand
-                    node_selector={
-                        "node-type": "simulation"
-                    },
+                    # Use service account with IRSA for S3 access
+                    service_account_name="simulation-runner" if storage_type == "s3" else None,
+                    affinity=affinity,
+                    node_selector=node_selector,
                     containers=[
                         client.V1Container(
                             name="sumo",
@@ -321,36 +583,58 @@ async def submit_job(tenant: dict, scenario_id: str, cpu_request: int,
     """Submit a SUMO simulation job"""
     # Validate resource request
     validate_resource_request(cpu_request, memory_gi, tenant)
-    
-    # Read and validate file
-    zip_content = await sumo_files.read()
-    config_file = validate_and_extract_zip(zip_content)
-    zip_b64 = base64.b64encode(zip_content).decode('utf-8')
-    
-    # Check concurrent jobs
-    check_concurrent_jobs(tenant['tenant_id'], tenant['max_concurrent_jobs'])
-    
-    # Create job record
+
+    check_queued_capacity(tenant["tenant_id"])
+
+    # Stream upload to disk (avoid loading into memory)
+    zip_path = await _save_upload_to_tempfile(sumo_files)
+    try:
+        config_file = validate_and_extract_zip_path(zip_path)
+    except Exception:
+        try:
+            os.unlink(zip_path)
+        except Exception:
+            pass
+        raise
+
     job_id = str(uuid.uuid4())
     k8s_name = f"sim-{job_id[:8]}"
-    
+    queue_key = _upload_queue_zip_to_s3(zip_path, tenant["tenant_id"], job_id)
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO jobs (job_id, tenant_id, k8s_job_name, k8s_namespace, status, scenario_data, cpu_request, memory_gi)
+                   VALUES (%s, %s, %s, %s, 'QUEUED', %s, %s, %s)""",
+                (
+                    job_id,
+                    tenant["tenant_id"],
+                    k8s_name,
+                    tenant["namespace"],
+                    Json({"scenario_id": scenario_id, "config_file": config_file, "queue_s3_key": queue_key}),
+                    cpu_request,
+                    memory_gi,
+                ),
+            )
+    except Exception:
+        _delete_queue_zip_from_s3(queue_key)
+        raise
+    finally:
+        try:
+            os.unlink(zip_path)
+        except Exception:
+            pass
+
+    ensure_tenant_namespace(tenant)
+    dispatch_queued_jobs()
+
     with get_db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO jobs (job_id, tenant_id, k8s_job_name, k8s_namespace, status, scenario_data, cpu_request, memory_gi)
-               VALUES (%s, %s, %s, %s, 'PENDING', %s, %s, %s)""",
-            (job_id, tenant['tenant_id'], k8s_name, tenant['namespace'], 
-             Json({"scenario_id": scenario_id, "config_file": config_file}), cpu_request, memory_gi)
-        )
-        conn.commit()
-    
-    # Ensure namespace exists
-    ensure_tenant_namespace(tenant)
-    
-    # Create Kubernetes Job
-    create_k8s_job(tenant, job_id, scenario_id, cpu_request, memory_gi, zip_b64, config_file)
-    
-    return {"job_id": job_id, "status": "PENDING", "config_file": config_file}
+        cur.execute("SELECT status FROM jobs WHERE job_id = %s", (job_id,))
+        row = cur.fetchone()
+        out_status = row["status"] if row else "QUEUED"
+
+    return {"job_id": job_id, "status": out_status, "config_file": config_file}
 
 def get_job_status(job_id: str, tenant_id: str):
     """Get job status"""
@@ -365,6 +649,15 @@ def get_job_status(job_id: str, tenant_id: str):
             raise HTTPException(status_code=404, detail="Job not found")
         job = dict(job)
     
+    if job["status"] == "QUEUED":
+        return {
+            "job_id": job_id,
+            "status": "QUEUED",
+            "submitted_at": job["submitted_at"].isoformat() if job["submitted_at"] else None,
+            "started_at": None,
+            "finished_at": None,
+        }
+
     # Try to get live status from K8s
     try:
         if k8s_available:
@@ -382,16 +675,32 @@ def get_job_status(job_id: str, tenant_id: str):
     except:
         status = job['status']
     
+    error_message = None
+    rf = job.get("result_files")
+    if isinstance(rf, dict):
+        error_message = rf.get("error_message")
+
     return {
         "job_id": job_id,
         "status": status,
         "submitted_at": job['submitted_at'].isoformat() if job['submitted_at'] else None,
         "started_at": job['started_at'].isoformat() if job['started_at'] else None,
-        "finished_at": job['finished_at'].isoformat() if job['finished_at'] else None
+        "finished_at": job['finished_at'].isoformat() if job['finished_at'] else None,
+        "error": error_message,
     }
 
 def get_job_logs(job_id: str, tenant_id: str, namespace: str, k8s_job_name: str):
     """Get job logs"""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT status FROM jobs WHERE job_id = %s AND tenant_id = %s",
+            (job_id, tenant_id),
+        )
+        row = cur.fetchone()
+    if row and row["status"] == "QUEUED":
+        return {"job_id": job_id, "logs": "Job queued; logs available after dispatch"}
+
     if not k8s_available:
         return {"job_id": job_id, "logs": "Kubernetes not available"}
     

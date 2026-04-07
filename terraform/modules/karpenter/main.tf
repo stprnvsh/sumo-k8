@@ -1,7 +1,7 @@
 # Karpenter IAM Role
 resource "aws_iam_role" "karpenter_controller" {
   name = "${var.cluster_name}-karpenter-controller"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -18,14 +18,14 @@ resource "aws_iam_role" "karpenter_controller" {
       }
     }]
   })
-  
+
   tags = var.tags
 }
 
 resource "aws_iam_role_policy" "karpenter_controller" {
   name = "${var.cluster_name}-karpenter-controller"
   role = aws_iam_role.karpenter_controller.id
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -55,7 +55,7 @@ resource "aws_iam_role_policy" "karpenter_controller" {
 # Karpenter Node Role
 resource "aws_iam_role" "karpenter_node" {
   name = "KarpenterNodeRole-${var.cluster_name}"
-  
+
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -66,7 +66,7 @@ resource "aws_iam_role" "karpenter_node" {
       Action = "sts:AssumeRole"
     }]
   })
-  
+
   tags = var.tags
 }
 
@@ -94,7 +94,7 @@ resource "aws_iam_role_policy_attachment" "karpenter_node_ssm" {
 resource "aws_iam_role_policy" "karpenter_node_s3" {
   name = "${var.cluster_name}-karpenter-node-s3"
   role = aws_iam_role.karpenter_node.id
-  
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -113,7 +113,7 @@ resource "aws_iam_role_policy" "karpenter_node_s3" {
 resource "aws_iam_instance_profile" "karpenter_node" {
   name = "KarpenterNodeInstanceProfile-${var.cluster_name}"
   role = aws_iam_role.karpenter_node.name
-  
+
   tags = var.tags
 }
 
@@ -121,7 +121,7 @@ resource "aws_iam_instance_profile" "karpenter_node" {
 provider "kubernetes" {
   host                   = var.cluster_endpoint
   cluster_ca_certificate = base64decode(var.cluster_ca)
-  
+
   exec {
     api_version = "client.authentication.k8s.io/v1beta1"
     command     = "aws"
@@ -139,7 +139,7 @@ provider "helm" {
   kubernetes {
     host                   = var.cluster_endpoint
     cluster_ca_certificate = base64decode(var.cluster_ca)
-    
+
     exec {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
@@ -160,26 +160,26 @@ resource "helm_release" "karpenter" {
   chart      = "karpenter"
   version    = "1.0.0"
   namespace  = "kube-system"
-  
+
   set {
     name  = "settings.clusterName"
     value = var.cluster_name
   }
-  
+
   set {
     name  = "settings.interruptionQueue"
     value = var.cluster_name
   }
-  
+
   set {
     name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
     value = aws_iam_role.karpenter_controller.arn
   }
-  
+
   depends_on = [aws_iam_role.karpenter_controller]
 }
 
-# Karpenter NodePool
+# Karpenter NodePool (keep in sync with k8s/karpenter-nodepool-simulation.yaml)
 resource "kubernetes_manifest" "karpenter_nodepool" {
   manifest = {
     apiVersion = "karpenter.sh/v1beta1"
@@ -188,6 +188,20 @@ resource "kubernetes_manifest" "karpenter_nodepool" {
       name = "simulation-nodes"
     }
     spec = {
+      disruption = {
+        consolidationPolicy = "WhenEmpty"
+        consolidateAfter    = "60s"
+        expireAfter         = "720h"
+        budgets = [
+          {
+            nodes = "10%"
+          }
+        ]
+      }
+      limits = {
+        cpu    = var.simulation_max_cpu
+        memory = var.simulation_max_memory
+      }
       template = {
         metadata = {
           labels = {
@@ -200,40 +214,19 @@ resource "kubernetes_manifest" "karpenter_nodepool" {
             name = "simulation-nodeclass"
           }
           requirements = [
-            {
-              key      = "kubernetes.io/arch"
-              operator = "In"
-              values   = ["amd64"]
-            },
-            {
-              key      = "kubernetes.io/os"
-              operator = "In"
-              values   = ["linux"]
-            },
-            {
-              key      = "karpenter.sh/capacity-type"
-              operator = "In"
-              values   = ["on-demand"]
-            },
-            {
-              key      = "node.kubernetes.io/instance-type"
-              operator = "In"
-              values   = var.simulation_instance_types
-            }
+            { key = "kubernetes.io/arch", operator = "In", values = ["amd64"] },
+            { key = "kubernetes.io/os", operator = "In", values = ["linux"] },
+            { key = "karpenter.sh/capacity-type", operator = "In", values = ["on-demand"] },
+            { key = "karpenter.k8s.aws/instance-category", operator = "In", values = ["c", "m", "r"] },
+            { key = "karpenter.k8s.aws/instance-generation", operator = "Gt", values = ["5"] },
+            { key = "karpenter.k8s.aws/instance-cpu", operator = "Gt", values = ["32"] },
+            { key = "karpenter.k8s.aws/instance-size", operator = "In", values = ["4xlarge", "8xlarge", "9xlarge", "12xlarge", "16xlarge"] },
           ]
         }
       }
-      limits = {
-        cpu    = var.simulation_max_cpu
-        memory = var.simulation_max_memory
-      }
-      disruption = {
-        consolidationPolicy = "WhenEmpty"
-        consolidateAfter    = "30s"
-      }
     }
   }
-  
+
   depends_on = [helm_release.karpenter]
 }
 
@@ -266,14 +259,14 @@ resource "kubernetes_manifest" "karpenter_nodeclass" {
           deleteOnTermination = true
         }
       }]
-      role   = aws_iam_role.karpenter_node.name
+      role     = aws_iam_role.karpenter_node.name
       userData = <<-EOT
         #!/bin/bash
         /etc/eks/bootstrap.sh ${var.cluster_name}
       EOT
     }
   }
-  
+
   depends_on = [helm_release.karpenter]
 }
 

@@ -20,6 +20,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Node
+node_modules/
+
 # Virtual environments
 env/
 venv/
@@ -28,13 +31,13 @@ env.bak/
 venv.bak/
 .venv
 
-# IDE
+# IDE / local tools
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 *~
-.DS_Store
 
 # Environment
 .env
@@ -61,8 +64,11 @@ logs/
 kubeconfig
 *.kubeconfig
 
-# Docker
-.dockerignore
+# Docker — do not ignore .dockerignore (needed in repo)
+
+# Next.js
+**/.next/
+out/
 
 # Documentation builds
 docs/_build/
@@ -76,6 +82,19 @@ temp/
 .DS_Store
 Thumbs.db
 
-# Large test files
+# Large test archives (keep small fixtures tracked explicitly if needed)
 test_networks/zips/sumo-scenarios.zip
+test_networks/zips/arbon_waelli.zip
+test_networks/zips/geneva.zip
 
+# Terraform (any path)
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+*.tfvars
+crash.log
+crash.*.log
+
+# Presentation exports (large local binaries)
+/SUMO-K8_Presentation.key
+/SUMO-K8_Presentation.pptx

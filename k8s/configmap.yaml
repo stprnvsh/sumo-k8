@@ -5,19 +5,28 @@ metadata:
   namespace: sumo-k8
 data:
   LOG_LEVEL: "INFO"
-  MAX_FILE_SIZE_MB: "100"
+  MAX_FILE_SIZE_MB: "2000"
   MAX_JOB_DURATION_HOURS: "24"
   CONFIGMAP_CLEANUP_DELAY_SECONDS: "300"
-  MAX_CONCURRENT_JOBS_PER_TENANT: "10"
+  MAX_CONCURRENT_JOBS_PER_TENANT: "100"
   DB_POOL_MIN: "2"
   DB_POOL_MAX: "10"
+  DEFAULT_MAX_CPU: "32"
+  DEFAULT_MAX_MEMORY_GI: "128"
+  SIMULATION_NODE_SELECTOR_KEY: "node-type"
+  SIMULATION_NODE_SELECTOR_VALUES: "simulation"
   CORS_ORIGINS: "*"
   # Admin key for warmup/scaling endpoints
   ADMIN_KEY: "admin-75b4c6ed101a0d11b5efd8953c521cb87a17875ccbf77395911321a005855a68"
-  # SUMO simulation image with Parquet/Arrow support
-  SUMO_IMAGE: "154794777636.dkr.ecr.eu-central-2.amazonaws.com/sumo-batch:parquet"
-  # Result storage - use S3 for results
+  # SUMO simulation image with Parquet/Arrow support and boto3
+  SUMO_IMAGE: "154794777636.dkr.ecr.eu-central-2.amazonaws.com/sumo-batch:slim"
+  # Result storage - direct S3 upload from job
   RESULT_STORAGE_TYPE: "s3"
   S3_BUCKET: "transcality-simulations"
   S3_REGION: "eu-central-2"
+  # Background workers
+  ENABLE_RECONCILER: "true"
+  ENABLE_CONFIGMAP_CLEANUP: "true"
+  # IAM role for IRSA - simulation pods use this for S3 access
+  S3_IAM_ROLE_ARN: "arn:aws:iam::154794777636:role/sumo-k8-simulation-s3"
 

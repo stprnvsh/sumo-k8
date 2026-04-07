@@ -4,12 +4,12 @@ from setuptools import setup, find_packages
 
 setup(
     name="sumo-k8-client",
-    version="1.0.0",
+    version="1.1.0",
     description="Python client for SUMO-K8 Kubernetes simulation controller",
     author="Transcality",
-    author_email="info@transcality.com",
-    url="https://github.com/transcality/sumo-k8",
-    packages=find_packages(),
+    author_email="pranav.sateesh@transcality.com",
+    url="https://github.com/stprnvsh/sumo-k8",
+    packages=find_packages(include=["sumo_k8_client", "sumo_k8_client.*"]),
     python_requires=">=3.8",
     install_requires=[
         "requests>=2.28.0",

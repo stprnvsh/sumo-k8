@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: queue-dashboard-web
+  namespace: sumo-k8
+  labels:
+    app.kubernetes.io/name: queue-dashboard-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: queue-dashboard-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: queue-dashboard-web
+    spec:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: infrastructure-nodes
+      containers:
+      - name: web
+        image: 154794777636.dkr.ecr.eu-central-2.amazonaws.com/queue-dashboard-web:queue-dashboard-20260330153330-amd64
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: DASHBOARD_API_URL
+          value: "http://queue-dashboard-api:8000"
+        resources:
+          requests:
+            cpu: "50m"
+            memory: "128Mi"
+          limits:
+            cpu: "250m"
+            memory: "256Mi"
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 2
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 3000
+          initialDelaySeconds: 15
+          periodSeconds: 20
+          timeoutSeconds: 2
+

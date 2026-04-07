@@ -5,7 +5,7 @@ import sys
 import threading
 import logging
 from datetime import datetime
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -22,7 +22,7 @@ from src.logs import stream_job_logs
 from src.scaling import get_cluster_nodes, get_cluster_activity, ensure_tenant_namespace
 from src.reconciler import sync_job_status, cleanup_old_configmaps
 from src.models import TenantCreate, TenantResponse, APIKeyRegenerate
-from src.storage import detect_storage_type
+from src.storage import detect_storage_type, list_s3_files
 
 # Configure logging
 logging.basicConfig(
@@ -36,6 +36,18 @@ app = FastAPI(
     description="Multi-tenant Kubernetes job controller for SUMO simulations",
     version="1.0.0"
 )
+
+# ============================================================================
+# Admin Auth (X-Admin-Key)
+# ============================================================================
+
+def require_admin(x_admin_key: str = Header(None, alias="X-Admin-Key")):
+    """Require X-Admin-Key for admin endpoints."""
+    if not config.ADMIN_KEY:
+        raise HTTPException(status_code=503, detail="Admin key not configured")
+    if not x_admin_key or x_admin_key.strip() != config.ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+    return True
 
 # CORS middleware
 app.add_middleware(
@@ -98,7 +110,7 @@ def readiness_check():
 # ============================================================================
 
 @app.post("/auth/register", response_model=TenantResponse)
-def register_tenant(tenant_data: TenantCreate):
+def register_tenant(tenant_data: TenantCreate, _admin_ok: bool = Depends(require_admin)):
     """Create a new tenant account"""
     tenant = create_tenant(
         tenant_id=tenant_data.tenant_id,
@@ -113,22 +125,28 @@ def register_tenant(tenant_data: TenantCreate):
     return tenant
 
 @app.post("/auth/regenerate-key", response_model=TenantResponse)
-def regenerate_key(request: APIKeyRegenerate):
+def regenerate_key(request: APIKeyRegenerate, _admin_ok: bool = Depends(require_admin)):
     """Regenerate API key for a tenant (admin operation)"""
     return regenerate_api_key(request.tenant_id)
 
 @app.get("/auth/tenants")
-def list_all_tenants():
+def list_all_tenants(_admin_ok: bool = Depends(require_admin)):
     """List all tenants (admin endpoint)"""
     return {"tenants": list_tenants()}
 
 @app.get("/auth/tenants/{tenant_id}", response_model=TenantResponse)
-def get_tenant_info(tenant_id: str):
+def get_tenant_info(tenant_id: str, _admin_ok: bool = Depends(require_admin)):
     """Get tenant information"""
     return get_tenant(tenant_id)
 
 @app.patch("/auth/tenants/{tenant_id}", response_model=TenantResponse)
-def update_tenant(tenant_id: str, max_cpu: int = None, max_memory_gi: int = None, max_concurrent_jobs: int = None):
+def update_tenant(
+    tenant_id: str,
+    max_cpu: int = None,
+    max_memory_gi: int = None,
+    max_concurrent_jobs: int = None,
+    _admin_ok: bool = Depends(require_admin),
+):
     """Update tenant resource limits"""
     tenant = update_tenant_limits(tenant_id, max_cpu, max_memory_gi, max_concurrent_jobs)
     # Update K8s resources
@@ -233,7 +251,16 @@ def get_job_results(job_id: str, authorization: str = Header(None, alias="Author
         result_info["message"] = f"Results stored in PVC at {job['result_location']}"
         result_info["access_note"] = "Use kubectl exec to access files from a pod mounting the PVC"
     elif storage_type in ("s3", "gcs", "azure"):
-        if job['result_files']:
+        if storage_type == "s3":
+            prefix = (job.get('result_files') or {}).get("prefix") or job.get("result_location") or ""
+            if prefix:
+                files = list_s3_files(prefix)
+                result_info["files"] = files
+                if not files:
+                    result_info["message"] = "No result files found in object storage yet"
+            else:
+                result_info["message"] = "Result prefix not available yet"
+        elif job['result_files']:
             result_info["files"] = job['result_files'].get("files", [])
         else:
             result_info["message"] = "Results are being uploaded to object storage"
@@ -281,6 +308,7 @@ def my_dashboard(authorization: str = Header(None, alias="Authorization")):
             pass
     
     stats = {
+        "queued": len([j for j in jobs if j['status'] == 'QUEUED']),
         "pending": len([j for j in jobs if j['status'] == 'PENDING']),
         "running": len([j for j in jobs if j['status'] == 'RUNNING']),
         "succeeded": len([j for j in jobs if j['status'] == 'SUCCEEDED']),
@@ -312,7 +340,7 @@ def my_dashboard(authorization: str = Header(None, alias="Authorization")):
 # ============================================================================
 
 @app.get("/admin/cluster")
-def cluster_status():
+def cluster_status(_admin_ok: bool = Depends(require_admin)):
     """Get cluster status (admin endpoint)"""
     if not k8s_available:
         return {"error": "Kubernetes not available", "nodes": [], "total_nodes": 0}
@@ -321,7 +349,7 @@ def cluster_status():
     return {"nodes": nodes, "total_nodes": len(nodes)}
 
 @app.get("/admin/jobs")
-def all_jobs(status: str = None):
+def all_jobs(status: str = None, _admin_ok: bool = Depends(require_admin)):
     """List all jobs (admin endpoint)"""
     with get_db() as conn:
         cur = conn.cursor()
@@ -360,7 +388,7 @@ def all_jobs(status: str = None):
         return {"jobs": jobs, "total": len(jobs)}
 
 @app.get("/admin/activity")
-def cluster_activity():
+def cluster_activity(_admin_ok: bool = Depends(require_admin)):
     """Get cluster activity stats (admin endpoint)"""
     activity = get_cluster_activity()
     
@@ -386,7 +414,12 @@ def cluster_activity():
 # ============================================================================
 
 @app.post("/admin/warmup")
-def warmup_cluster(cpu_request: int = 2, memory_gi: int = 4, keep_alive_seconds: int = 300):
+def warmup_cluster(
+    cpu_request: int = 2,
+    memory_gi: int = 4,
+    keep_alive_seconds: int = 300,
+    _admin_ok: bool = Depends(require_admin),
+):
     """
     Pre-warm the cluster by spinning up a simulation node and pulling the SUMO image.
     
@@ -423,6 +456,31 @@ sleep {keep_alive_seconds}
 echo "Warmup complete"
 """
     
+    # Scheduling: allow multiple node selector values via node affinity
+    node_selector = None
+    affinity = None
+    key = getattr(config, 'SIMULATION_NODE_SELECTOR_KEY', 'node-type')
+    values = getattr(config, 'SIMULATION_NODE_SELECTOR_VALUES', ['simulation'])
+    if key and values:
+        if len(values) == 1:
+            node_selector = {key: values[0]}
+        else:
+            affinity = client.V1Affinity(
+                node_affinity=client.V1NodeAffinity(
+                    required_during_scheduling_ignored_during_execution=client.V1NodeSelector(
+                        node_selector_terms=[
+                            client.V1NodeSelectorTerm(
+                                match_expressions=[
+                                    client.V1NodeSelectorRequirement(
+                                        key=key, operator='In', values=values
+                                    )
+                                ]
+                            )
+                        ]
+                    )
+                )
+            )
+
     job_manifest = client.V1Job(
         metadata=client.V1ObjectMeta(
             name=job_name,
@@ -437,7 +495,8 @@ echo "Warmup complete"
                     labels={"app": "sumo-k8-warmup", "warmup-id": warmup_id}
                 ),
                 spec=client.V1PodSpec(
-                    node_selector={"node-type": "simulation"},
+                    affinity=affinity,
+                    node_selector=node_selector,
                     containers=[
                         client.V1Container(
                             name="warmup",
@@ -475,7 +534,7 @@ echo "Warmup complete"
         raise HTTPException(status_code=500, detail=f"Failed to create warmup job: {str(e)}")
 
 @app.get("/admin/warmup/status")
-def warmup_status():
+def warmup_status(_admin_ok: bool = Depends(require_admin)):
     """Check status of warmup jobs"""
     if not k8s_available:
         raise HTTPException(status_code=503, detail="Kubernetes not available")
@@ -525,7 +584,7 @@ def warmup_status():
     }
 
 @app.delete("/admin/warmup/{warmup_id}")
-def cancel_warmup(warmup_id: str):
+def cancel_warmup(warmup_id: str, _admin_ok: bool = Depends(require_admin)):
     """Cancel a warmup job"""
     if not k8s_available:
         raise HTTPException(status_code=503, detail="Kubernetes not available")
@@ -559,13 +618,19 @@ def startup_event():
     """Initialize on startup"""
     init_db_pool()
     
-    reconciler_thread = threading.Thread(target=sync_job_status, daemon=True)
-    reconciler_thread.start()
-    logger.info("Background job reconciler started")
+    if os.getenv("ENABLE_RECONCILER", "false").lower() == "true":
+        reconciler_thread = threading.Thread(target=sync_job_status, daemon=True)
+        reconciler_thread.start()
+        logger.info("Background job reconciler started")
+    else:
+        logger.warning("Background job reconciler disabled (set ENABLE_RECONCILER=true to enable)")
     
-    cleanup_thread = threading.Thread(target=cleanup_old_configmaps, daemon=True)
-    cleanup_thread.start()
-    logger.info("Background ConfigMap cleanup started")
+    if os.getenv("ENABLE_CONFIGMAP_CLEANUP", "false").lower() == "true":
+        cleanup_thread = threading.Thread(target=cleanup_old_configmaps, daemon=True)
+        cleanup_thread.start()
+        logger.info("Background ConfigMap cleanup started")
+    else:
+        logger.warning("Background ConfigMap cleanup disabled (set ENABLE_CONFIGMAP_CLEANUP=true to enable)")
 
 @app.on_event("shutdown")
 def shutdown_event():

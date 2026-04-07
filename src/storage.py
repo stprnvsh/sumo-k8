@@ -285,6 +285,20 @@ def list_s3_files(prefix: str) -> List[Dict]:
         logger.error(f"Failed to list S3 files: {e}")
         return []
 
+def s3_prefix_has_files(prefix: str) -> bool:
+    """Cheap existence check for any file under an S3 prefix."""
+    if not S3_BUCKET or not prefix:
+        return False
+
+    try:
+        import boto3
+        s3_client = boto3.client('s3', region_name=S3_REGION)
+        page = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1)
+        return len(page.get('Contents', [])) > 0
+    except Exception as e:
+        logger.error(f"Failed to check S3 prefix existence: {e}")
+        return False
+
 def upload_results_from_pvc(job_id: str, tenant_id: str, tenant_namespace: str, storage_type: str) -> Optional[Dict]:
     """Create a temporary pod to upload results from PVC to object storage"""
     if storage_type not in ("s3", "gcs", "azure"):

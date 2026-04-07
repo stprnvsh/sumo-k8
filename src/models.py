@@ -6,9 +6,10 @@ from datetime import datetime
 class TenantCreate(BaseModel):
     """Request model for creating a tenant"""
     tenant_id: str = Field(..., min_length=1, max_length=100, description="Unique tenant identifier")
-    max_cpu: Optional[int] = Field(10, ge=1, le=100, description="Maximum CPU quota")
-    max_memory_gi: Optional[int] = Field(20, ge=1, le=500, description="Maximum memory quota in Gi")
-    max_concurrent_jobs: Optional[int] = Field(2, ge=1, le=50, description="Maximum concurrent jobs")
+    # Allow large quotas for high-throughput tenants (e.g. 20x 16CPU/32Gi jobs => 320CPU/640Gi).
+    max_cpu: Optional[int] = Field(32, ge=1, le=1000, description="Maximum CPU quota")
+    max_memory_gi: Optional[int] = Field(128, ge=1, le=5000, description="Maximum memory quota in Gi")
+    max_concurrent_jobs: Optional[int] = Field(2, ge=1, le=200, description="Maximum concurrent jobs")
 
 class TenantResponse(BaseModel):
     """Response model for tenant"""

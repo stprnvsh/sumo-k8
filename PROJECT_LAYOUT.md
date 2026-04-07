@@ -25,6 +25,11 @@ sumo-k8/
 │   ├── README_SETUP.md      # Setup instructions
 │   ├── FEATURES.md          # Feature list
 │   └── PROJECT_STRUCTURE.md # Project status tracker
+├── k8s/                      # Kubernetes manifests
+│   └── *.yaml                # Postgres/controller/dashboard pin to EKS nodegroup infrastructure-nodes
+├── queue-dashboard/        # Queue dashboard (standalone) docs
+├── queue-dashboard-api/     # FastAPI queue dashboard backend
+├── queue-dashboard-web/     # Next.js queue dashboard frontend
 │
 ├── scripts/                  # Utility scripts
 │   └── test_api.sh          # API testing script
@@ -38,6 +43,7 @@ sumo-k8/
 │       └── ...
 │
 ├── schema.sql               # Database schema
+├── migrations/              # One-off SQL migrations (e.g. QUEUED status)
 ├── requirements.txt         # Python dependencies
 ├── Dockerfile              # Container image definition
 ├── docker-compose.yml      # Local development setup

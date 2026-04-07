@@ -1,0 +1,53 @@
+# Stage 1: Full SUMO image with Arrow - we'll copy from here
+FROM ghcr.io/eclipse-sumo/sumo:latest AS sumo-full
+
+# Install Arrow/Parquet in the SUMO image first
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl gnupg lsb-release \
+    && curl -fsSL https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb -o /tmp/arrow.deb \
+    && apt-get install -y /tmp/arrow.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libarrow2300 libparquet2300 \
+    && rm -rf /var/lib/apt/lists/* /tmp/arrow.deb
+
+# Collect all library dependencies into /sumo-libs
+RUN mkdir -p /sumo-libs && \
+    (ldd /usr/bin/sumo | grep "=>" | awk '{print $3}' | xargs -I{} cp -L {} /sumo-libs/ 2>/dev/null || true) && \
+    cp -L /usr/lib/x86_64-linux-gnu/libarrow* /sumo-libs/ 2>/dev/null || true && \
+    cp -L /usr/lib/x86_64-linux-gnu/libparquet* /sumo-libs/ 2>/dev/null || true
+
+# Stage 2: Minimal runtime  
+FROM ubuntu:22.04
+
+# Only install Python and unzip
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    python3-minimal \
+    python3-pip \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy all SUMO + Arrow library dependencies
+COPY --from=sumo-full /sumo-libs/ /usr/lib/x86_64-linux-gnu/
+
+# Copy SUMO binary
+COPY --from=sumo-full /usr/bin/sumo /usr/bin/sumo
+
+# Copy minimal SUMO data
+COPY --from=sumo-full /usr/share/sumo/data /usr/share/sumo/data
+
+# Update library cache
+RUN ldconfig
+
+# Install boto3
+RUN pip3 install --no-cache-dir boto3
+
+# Add upload script
+COPY scripts/upload_results.py /scripts/upload_results.py
+
+ENV SUMO_HOME=/usr/share/sumo
+
+# Verify
+RUN sumo --version
+
+WORKDIR /workspace

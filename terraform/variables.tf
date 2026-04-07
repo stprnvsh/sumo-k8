@@ -60,23 +60,17 @@ variable "infrastructure_max_size" {
   default     = 3
 }
 
-# Simulation Nodes (Karpenter)
-variable "simulation_instance_types" {
-  description = "EC2 instance types for simulation nodes"
-  type        = list(string)
-  default     = ["c5.4xlarge", "c7i.4xlarge", "c7i.8xlarge", "c5.9xlarge"]
-}
-
+# Simulation Nodes (Karpenter) — instance shape rules live in modules/karpenter (match k8s/karpenter-nodepool-simulation.yaml)
 variable "simulation_max_cpu" {
-  description = "Maximum total CPUs for simulation nodes"
+  description = "NodePool aggregate CPU limit"
   type        = string
-  default     = "200"
+  default     = "6000"
 }
 
 variable "simulation_max_memory" {
-  description = "Maximum total memory for simulation nodes"
+  description = "NodePool aggregate memory limit"
   type        = string
-  default     = "1600Gi"
+  default     = "6000Gi"
 }
 
 # Application Configuration
