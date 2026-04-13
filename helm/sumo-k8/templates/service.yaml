@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sumo-k8.fullname" . }}
+  namespace: {{ .Values.namespace | default "sumo-k8" }}
+  labels:
+    {{- include "sumo-k8.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "sumo-k8.selectorLabels" . | nindent 4 }}

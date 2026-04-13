@@ -1,0 +1,116 @@
+{{- if and .Values.dashboard .Values.dashboard.api .Values.dashboard.api.enabled }}
+---
+# ─── Queue Dashboard API ────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sumo-k8.fullname" . }}-dashboard-api
+  namespace: {{ .Values.namespace | default "sumo-k8" }}
+  labels:
+    {{- include "sumo-k8.labels" . | nindent 4 }}
+    component: dashboard-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sumo-k8.selectorLabels" . | nindent 6 }}
+      component: dashboard-api
+  template:
+    metadata:
+      labels:
+        {{- include "sumo-k8.selectorLabels" . | nindent 8 }}
+        component: dashboard-api
+    spec:
+      # No imagePullSecrets — ECR pulls via EKS node IAM role
+      serviceAccountName: {{ include "sumo-k8.serviceAccountName" . }}
+      containers:
+        - name: dashboard-api
+          image: "{{ .Values.dashboard.api.image.repository }}:{{ .Values.dashboard.api.image.tag | default "latest" }}"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              {{- if .Values.database.url }}
+              value: {{ .Values.database.url | quote }}
+              {{- else }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sumo-k8.fullname" . }}-secrets
+                  key: DATABASE_URL
+              {{- end }}
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sumo-k8.fullname" . }}-dashboard-api
+  namespace: {{ .Values.namespace | default "sumo-k8" }}
+spec:
+  selector:
+    {{- include "sumo-k8.selectorLabels" . | nindent 4 }}
+    component: dashboard-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+{{- end }}
+
+{{- if and .Values.dashboard .Values.dashboard.web .Values.dashboard.web.enabled }}
+---
+# ─── Queue Dashboard Web ─────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sumo-k8.fullname" . }}-dashboard-web
+  namespace: {{ .Values.namespace | default "sumo-k8" }}
+  labels:
+    {{- include "sumo-k8.labels" . | nindent 4 }}
+    component: dashboard-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "sumo-k8.selectorLabels" . | nindent 6 }}
+      component: dashboard-web
+  template:
+    metadata:
+      labels:
+        {{- include "sumo-k8.selectorLabels" . | nindent 8 }}
+        component: dashboard-web
+    spec:
+      containers:
+        - name: dashboard-web
+          image: "{{ .Values.dashboard.web.image.repository }}:{{ .Values.dashboard.web.image.tag | default "latest" }}"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NEXT_PUBLIC_API_URL
+              value: "http://{{ include "sumo-k8.fullname" . }}-dashboard-api:8000"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sumo-k8.fullname" . }}-dashboard-web
+  namespace: {{ .Values.namespace | default "sumo-k8" }}
+spec:
+  selector:
+    {{- include "sumo-k8.selectorLabels" . | nindent 4 }}
+    component: dashboard-web
+  ports:
+    - port: 3000
+      targetPort: 3000
+{{- end }}

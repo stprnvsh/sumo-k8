@@ -1,0 +1,143 @@
+name: Build SUMO-K8 → ECR
+
+# Builds all 4 images when this repo is pushed directly.
+# Also triggered by infra_module monorepo via services/sumo-controller submodule.
+#
+# Images built:
+#   sumo-k8-controller    — FastAPI job manager      (Dockerfile)
+#   sumo-k8-runner        — SUMO simulation runner   (Dockerfile.sumo-slim)
+#   sumo-k8-dashboard-api — Queue dashboard API      (queue-dashboard-api/Dockerfile)
+#   sumo-k8-dashboard-web — Queue dashboard web      (queue-dashboard-web/Dockerfile)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - staging
+      - "staging/*"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION:     ${{ vars.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      env_tag:   ${{ steps.meta.outputs.env_tag }}
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+      ecr_base:  ${{ steps.meta.outputs.ecr_base }}
+    steps:
+      - id: meta
+        run: |
+          REF="${{ github.ref_name }}"
+          case "$REF" in
+            main)              ENV_TAG="prod"    ;;
+            staging|staging/*) ENV_TAG="staging" ;;
+            *)                 ENV_TAG="dev"     ;;
+          esac
+          echo "env_tag=${ENV_TAG}"                                                              >> $GITHUB_OUTPUT
+          echo "sha_short=${GITHUB_SHA:0:12}"                                                    >> $GITHUB_OUTPUT
+          echo "ecr_base=${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> $GITHUB_OUTPUT
+
+  build-controller:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-controller:${{ needs.meta.outputs.env_tag }}-latest
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-controller:${{ needs.meta.outputs.env_tag }}-${{ needs.meta.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-controller:cache-${{ needs.meta.outputs.env_tag }}
+          cache-to:   type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-controller:cache-${{ needs.meta.outputs.env_tag }},mode=max
+      - name: Dispatch to plan-deployment
+        if: success()
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GH_PAT }}
+          repository: transcality/infra_module
+          event-type: build-sumo-controller
+          client-payload: '{"sha": "${{ github.sha }}", "env": "${{ needs.meta.outputs.env_tag }}"}'
+
+  build-runner:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.sumo-slim
+          push: true
+          tags: |
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-runner:${{ needs.meta.outputs.env_tag }}-latest
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-runner:${{ needs.meta.outputs.env_tag }}-${{ needs.meta.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-runner:cache-${{ needs.meta.outputs.env_tag }}
+          cache-to:   type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-runner:cache-${{ needs.meta.outputs.env_tag }},mode=max
+
+  build-dashboard-api:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: queue-dashboard-api
+          file:    queue-dashboard-api/Dockerfile
+          push:    true
+          tags: |
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-api:${{ needs.meta.outputs.env_tag }}-latest
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-api:${{ needs.meta.outputs.env_tag }}-${{ needs.meta.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-api:cache-${{ needs.meta.outputs.env_tag }}
+          cache-to:   type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-api:cache-${{ needs.meta.outputs.env_tag }},mode=max
+
+  build-dashboard-web:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions-ecr-push
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: queue-dashboard-web
+          file:    queue-dashboard-web/Dockerfile
+          push:    true
+          tags: |
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-web:${{ needs.meta.outputs.env_tag }}-latest
+            ${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-web:${{ needs.meta.outputs.env_tag }}-${{ needs.meta.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-web:cache-${{ needs.meta.outputs.env_tag }}
+          cache-to:   type=registry,ref=${{ needs.meta.outputs.ecr_base }}/sumo-k8-dashboard-web:cache-${{ needs.meta.outputs.env_tag }},mode=max
