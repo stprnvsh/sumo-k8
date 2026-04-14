@@ -162,12 +162,20 @@ async def submit_job_endpoint(
     scenario_id: str = Form(..., min_length=1, max_length=100),
     cpu_request: int = Form(2, ge=1, le=32),
     memory_gi: int = Form(4, ge=1, le=128),
-    sumo_files: UploadFile = File(...),
+    sumo_files: UploadFile | None = File(None),
+    sumo_files_s3_url: str | None = Form(None),
     authorization: str = Header(None, alias="Authorization")
 ):
     """Submit a SUMO simulation job"""
     tenant = get_tenant_from_header(authorization)
-    return await submit_job(tenant, scenario_id, cpu_request, memory_gi, sumo_files)
+    return await submit_job(
+        tenant,
+        scenario_id,
+        cpu_request,
+        memory_gi,
+        sumo_files=sumo_files,
+        sumo_files_s3_url=sumo_files_s3_url,
+    )
 
 @app.get("/jobs/{job_id}")
 def get_job_status_endpoint(job_id: str, authorization: str = Header(None, alias="Authorization")):

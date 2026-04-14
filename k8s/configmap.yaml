@@ -27,6 +27,13 @@ data:
   # Background workers
   ENABLE_RECONCILER: "true"
   ENABLE_CONFIGMAP_CLEANUP: "true"
+  # Guarded legacy cleanup for old chunk ConfigMaps
+  ENABLE_LEGACY_CONFIGMAP_SWEEPER: "true"
+  LEGACY_CONFIGMAP_SWEEPER_NAMESPACES: "transcality"
+  LEGACY_CONFIGMAP_SWEEPER_PREFIX: "sumo-"
+  LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS: "-chunk"
+  LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS: "6"
+  LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN: "1000"
   # IAM role for IRSA - simulation pods use this for S3 access
   S3_IAM_ROLE_ARN: "arn:aws:iam::154794777636:role/sumo-k8-simulation-s3"
 

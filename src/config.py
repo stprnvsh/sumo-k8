@@ -52,6 +52,16 @@ AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "")
 # SUMO simulation image
 SUMO_IMAGE = os.getenv("SUMO_IMAGE", "ghcr.io/eclipse-sumo/sumo:latest")
 
+# Legacy ConfigMap sweeper (for old sumo-*-chunk* objects that missed cleanup)
+ENABLE_LEGACY_CONFIGMAP_SWEEPER = os.getenv("ENABLE_LEGACY_CONFIGMAP_SWEEPER", "false").lower() == "true"
+LEGACY_CONFIGMAP_SWEEPER_NAMESPACES = [
+    v.strip() for v in os.getenv("LEGACY_CONFIGMAP_SWEEPER_NAMESPACES", "").split(",") if v.strip()
+]
+LEGACY_CONFIGMAP_SWEEPER_PREFIX = os.getenv("LEGACY_CONFIGMAP_SWEEPER_PREFIX", "sumo-")
+LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS = os.getenv("LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS", "-chunk")
+LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS = int(os.getenv("LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS", "6"))
+LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN = int(os.getenv("LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN", "100"))
+
 # Scheduling for simulation pods
 # Default keeps current behavior (node-type=simulation). You can pass multiple values
 # (comma-separated) to allow multiple node pools.

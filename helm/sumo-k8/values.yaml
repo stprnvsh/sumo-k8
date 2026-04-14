@@ -70,9 +70,24 @@ config:
 database:
   url: ""  # If empty, uses postgres service if postgres.enabled=true
 
-nodeSelector: {}
+nodeSelector:
+  node-type: infrastructure
 
 tolerations: []
 
 affinity: {}
+
+# Queue dashboard — disabled by default; enable per-env in plan-stack values
+# dashboard.api.image and dashboard.web.image are set in plan-stack values-*.yaml
+dashboard:
+  api:
+    enabled: false
+    image:
+      repository: ""   # set in plan-stack values-{env}.yaml
+      tag: "latest"
+  web:
+    enabled: false
+    image:
+      repository: ""   # set in plan-stack values-{env}.yaml
+      tag: "latest"
 

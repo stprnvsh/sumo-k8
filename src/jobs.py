@@ -7,6 +7,7 @@ import logging
 import tempfile
 import json
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 from fastapi import HTTPException, UploadFile
 from kubernetes import client
 from .database import get_db
@@ -127,6 +128,59 @@ async def _save_upload_to_tempfile(upload: UploadFile) -> str:
             tmp.close()
         except Exception:
             pass
+
+
+def _parse_s3_url(s3_url: str) -> tuple[str, str]:
+    """Parse a supported S3 URL into (bucket, key)."""
+    parsed = urlparse((s3_url or "").strip())
+    if parsed.scheme != "s3":
+        raise HTTPException(
+            status_code=400,
+            detail="sumo_files_s3_url must be an s3:// URL (e.g., s3://my-bucket/path/file.zip)",
+        )
+
+    bucket = parsed.netloc.strip()
+    key = unquote(parsed.path.lstrip("/"))
+    if not bucket or not key:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid s3:// URL: bucket and object key are required",
+        )
+    return bucket, key
+
+
+def _save_s3_zip_to_tempfile(s3_url: str) -> str:
+    """Download ZIP from S3 URL to tempfile with max-size guard."""
+    bucket, key = _parse_s3_url(s3_url)
+    s3 = boto3.client("s3", region_name=S3_REGION)
+
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot access S3 object: {e}")
+
+    size_bytes = int(head.get("ContentLength") or 0)
+    max_bytes = int(MAX_FILE_SIZE_MB) * 1024 * 1024
+    if size_bytes <= 0:
+        raise HTTPException(status_code=400, detail="S3 object is empty")
+    if size_bytes > max_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large: {size_bytes / 1024 / 1024:.2f}MB (max: {MAX_FILE_SIZE_MB}MB)",
+        )
+
+    tmp = tempfile.NamedTemporaryFile(prefix="sumo_s3_", suffix=".zip", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        s3.download_file(bucket, key, tmp_path)
+        return tmp_path
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=f"Failed to download S3 object: {e}")
 
 def _iter_base64_from_file(file_path: str, read_bytes: int = 1024 * 1024):
     """Yield base64 text chunks for file content without buffering entire file."""
@@ -308,6 +362,7 @@ def create_k8s_job(
         raise HTTPException(status_code=503, detail="Kubernetes not available")
     
     k8s_name = f"sim-{job_id[:8]}"
+    cm_prefix = f"sumo-{job_id[:8]}-{uuid.uuid4().hex[:6]}"
     max_chunk_size = 900000  # Leave margin under 1MB limit
 
     # Estimate base64 length without encoding entire file in memory.
@@ -315,7 +370,6 @@ def create_k8s_job(
 
     # Handle large files by splitting into ConfigMaps (streaming base64 from disk).
     if est_b64_len > max_chunk_size:
-        num_chunks = (est_b64_len + max_chunk_size - 1) // max_chunk_size
         configmap_chunks = []
 
         buf = ""
@@ -327,7 +381,7 @@ def create_k8s_job(
                     chunk_data = buf[:max_chunk_size]
                     buf = buf[max_chunk_size:]
 
-                    chunk_name = f"sumo-{job_id[:8]}-chunk{chunk_idx}"
+                    chunk_name = f"{cm_prefix}-chunk{chunk_idx}"
                     chunk_idx += 1
                     configmap = client.V1ConfigMap(
                         metadata=client.V1ObjectMeta(
@@ -342,7 +396,7 @@ def create_k8s_job(
                     logger.info(f"Created ConfigMap chunk {chunk_name} ({len(chunk_data)} bytes)")
 
             if buf:
-                chunk_name = f"sumo-{job_id[:8]}-chunk{chunk_idx}"
+                chunk_name = f"{cm_prefix}-chunk{chunk_idx}"
                 configmap = client.V1ConfigMap(
                     metadata=client.V1ObjectMeta(
                         name=chunk_name,
@@ -364,6 +418,7 @@ def create_k8s_job(
             raise HTTPException(status_code=500, detail=f"Failed to store files: {str(e)}")
         
         # Build volumes for chunks
+        num_chunks = len(configmap_chunks)
         volumes = []
         volume_mounts = []
         for i, chunk_name in enumerate(configmap_chunks):
@@ -417,7 +472,7 @@ python3 /scripts/upload_results.py
         ]
     else:
         # Single ConfigMap for small files
-        configmap_name = f"sumo-{job_id[:8]}"
+        configmap_name = f"{cm_prefix}-bundle"
         zip_b64 = ""
         try:
             for part in _iter_base64_from_file(zip_path):
@@ -578,16 +633,34 @@ python3 /scripts/upload_results.py
         cleanup_configmaps(tenant['namespace'], job_id, delay_seconds=0)
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
 
-async def submit_job(tenant: dict, scenario_id: str, cpu_request: int, 
-                    memory_gi: int, sumo_files: UploadFile):
+async def submit_job(
+    tenant: dict,
+    scenario_id: str,
+    cpu_request: int,
+    memory_gi: int,
+    sumo_files: UploadFile | None = None,
+    sumo_files_s3_url: str | None = None,
+):
     """Submit a SUMO simulation job"""
     # Validate resource request
     validate_resource_request(cpu_request, memory_gi, tenant)
 
     check_queued_capacity(tenant["tenant_id"])
 
-    # Stream upload to disk (avoid loading into memory)
-    zip_path = await _save_upload_to_tempfile(sumo_files)
+    has_upload = sumo_files is not None
+    has_s3_url = bool((sumo_files_s3_url or "").strip())
+    if has_upload == has_s3_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one input: sumo_files upload or sumo_files_s3_url",
+        )
+
+    # Resolve source ZIP to local tempfile (no large in-memory buffers).
+    if has_upload:
+        zip_path = await _save_upload_to_tempfile(sumo_files)
+    else:
+        zip_path = _save_s3_zip_to_tempfile(sumo_files_s3_url or "")
+
     try:
         config_file = validate_and_extract_zip_path(zip_path)
     except Exception:

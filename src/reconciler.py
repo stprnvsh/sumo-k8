@@ -8,6 +8,14 @@ from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
 from .jobs import dispatch_queued_jobs
 from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
+from .config import (
+    ENABLE_LEGACY_CONFIGMAP_SWEEPER,
+    LEGACY_CONFIGMAP_SWEEPER_NAMESPACES,
+    LEGACY_CONFIGMAP_SWEEPER_PREFIX,
+    LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS,
+    LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS,
+    LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN,
+)
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
@@ -336,7 +344,7 @@ def sync_job_status():
                                     (new_status, result_location, result_files, job['job_id'])
                                 )
                                 # Schedule ConfigMap cleanup
-                                cleanup_configmaps(job['k8s_namespace'], str(job['job_id']))
+                                cleanup_configmaps(job['k8s_namespace'], str(job['job_id']), delay_seconds=0)
                             else:
                                 update_cur.execute(
                                     "UPDATE jobs SET status = %s WHERE job_id = %s",
@@ -465,6 +473,73 @@ def cleanup_old_configmaps():
                             logger.debug(f"Failed deleting ConfigMap {cm_name}: {e}")
                 except Exception as e:
                     logger.debug(f"Error cleaning ConfigMaps in {ns.metadata.name}: {e}")
+
+            if ENABLE_LEGACY_CONFIGMAP_SWEEPER and LEGACY_CONFIGMAP_SWEEPER_NAMESPACES:
+                now = datetime.now()
+                min_age = timedelta(hours=LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS)
+                deleted_count = 0
+                requested_namespaces = set(LEGACY_CONFIGMAP_SWEEPER_NAMESPACES)
+                existing_namespaces = {ns.metadata.name for ns in namespaces.items}
+
+                for ns_name in sorted(requested_namespaces):
+                    if deleted_count >= LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN:
+                        break
+                    if ns_name not in existing_namespaces:
+                        logger.warning(f"Legacy sweeper namespace not found: {ns_name}")
+                        continue
+
+                    continue_token = None
+                    while deleted_count < LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN:
+                        configmaps = k8s_core.list_namespaced_config_map(
+                            ns_name,
+                            limit=100,
+                            _continue=continue_token,
+                        )
+                        for cm in configmaps.items:
+                            name = cm.metadata.name or ""
+                            if not name.startswith(LEGACY_CONFIGMAP_SWEEPER_PREFIX):
+                                continue
+                            if LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS not in name:
+                                continue
+
+                            created_at = cm.metadata.creation_timestamp
+                            if not created_at:
+                                continue
+                            age = now - created_at.replace(tzinfo=None)
+                            if age < min_age:
+                                continue
+
+                            try:
+                                k8s_core.delete_namespaced_config_map(name, ns_name)
+                                deleted_count += 1
+                                logger.info(
+                                    "Legacy sweeper deleted ConfigMap %s in %s (age=%s)",
+                                    name,
+                                    ns_name,
+                                    age,
+                                )
+                            except client.exceptions.ApiException as e:
+                                if e.status != 404:
+                                    logger.debug(f"Legacy sweeper failed deleting {name} in {ns_name}: {e}")
+                            except Exception as e:
+                                logger.debug(f"Legacy sweeper failed deleting {name} in {ns_name}: {e}")
+
+                            if deleted_count >= LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN:
+                                break
+
+                        continue_token = configmaps.metadata._continue
+                        if not continue_token or deleted_count >= LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN:
+                            break
+
+                if deleted_count:
+                    logger.info(
+                        "Legacy sweeper deleted %s ConfigMap(s) this cycle (prefix=%s, contains=%s, min_age_hours=%s, namespaces=%s)",
+                        deleted_count,
+                        LEGACY_CONFIGMAP_SWEEPER_PREFIX,
+                        LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS,
+                        LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS,
+                        ",".join(sorted(requested_namespaces)),
+                    )
         except Exception as e:
             logger.error(f"ConfigMap cleanup error: {e}")
         

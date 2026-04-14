@@ -208,16 +208,20 @@ def cleanup_configmaps(namespace: str, job_id: str, delay_seconds: int = CONFIGM
             return
         time.sleep(delay_seconds)
         try:
-            configmaps = k8s_core.list_namespaced_config_map(namespace)
-            job_prefix = f"sumo-{job_id[:8]}"
-            
+            configmaps = k8s_core.list_namespaced_config_map(
+                namespace,
+                label_selector=f"cleanup=true,job-id={job_id}",
+            )
+
             for cm in configmaps.items:
-                if cm.metadata.name.startswith(job_prefix):
-                    try:
-                        k8s_core.delete_namespaced_config_map(cm.metadata.name, namespace)
-                        logger.info(f"Cleaned up ConfigMap {cm.metadata.name}")
-                    except Exception as e:
+                try:
+                    k8s_core.delete_namespaced_config_map(cm.metadata.name, namespace)
+                    logger.info(f"Cleaned up ConfigMap {cm.metadata.name}")
+                except client.exceptions.ApiException as e:
+                    if e.status != 404:
                         logger.warning(f"Failed to delete ConfigMap {cm.metadata.name}: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete ConfigMap {cm.metadata.name}: {e}")
         except Exception as e:
             logger.error(f"ConfigMap cleanup error: {e}")
     
