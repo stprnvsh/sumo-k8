@@ -7,7 +7,7 @@ spec:
     # Keep the existing behavior: scale back down when empty.
     consolidationPolicy: WhenEmpty
     consolidateAfter: 60s
-    expireAfter: 720h
+    expireAfter: 12h
     budgets:
     - nodes: 10%
   limits:

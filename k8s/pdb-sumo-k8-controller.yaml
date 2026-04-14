@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sumo-k8-controller
+  namespace: sumo-k8
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sumo-k8-controller

@@ -6,6 +6,8 @@ namespace: sumo-k8
 resources:
   - namespace.yaml
   - serviceaccount.yaml
+  - stale-simulations-cleanup-cronjob.yaml
+  - pdb-sumo-k8-controller.yaml
   - configmap.yaml
   - deployment.yaml
   - service.yaml

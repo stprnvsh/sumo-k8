@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: stale-simulations-cleanup
+  namespace: sumo-k8
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: sumo-k8-controller
+          restartPolicy: OnFailure
+          containers:
+            - name: cleaner
+              image: bitnami/kubectl:latest
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -eu
+                  cutoff_jobs_epoch="$(date -u -d '12 hours ago' +%s)"
+                  cutoff_pending_epoch="$(date -u -d '1 hour ago' +%s)"
+
+                  # 1) Delete stale simulation jobs older than 12h.
+                  kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.creationTimestamp}{"\n"}{end}' \
+                  | while IFS='|' read -r ns name created; do
+                      case "$name" in
+                        sim-*) ;;
+                        *) continue ;;
+                      esac
+                      created_epoch="$(date -u -d "$created" +%s 2>/dev/null || echo 0)"
+                      [ "$created_epoch" -eq 0 ] && continue
+                      if [ "$created_epoch" -lt "$cutoff_jobs_epoch" ]; then
+                        kubectl delete job "$name" -n "$ns" --ignore-not-found=true
+                      fi
+                    done
+
+                  # 1b) Delete sim-* jobs older than 1h that still have zero pods (e.g. repeated FailedCreate).
+                  kubectl get jobs -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.creationTimestamp}{"\n"}{end}' \
+                  | while IFS='|' read -r ns name created; do
+                      case "$name" in
+                        sim-*) ;;
+                        *) continue ;;
+                      esac
+                      created_epoch="$(date -u -d "$created" +%s 2>/dev/null || echo 0)"
+                      [ "$created_epoch" -eq 0 ] && continue
+                      [ "$created_epoch" -lt "$cutoff_pending_epoch" ] || continue
+                      pod_count="$(kubectl get pods -n "$ns" -l job-name="$name" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+                      if [ "$pod_count" = "0" ]; then
+                        kubectl delete job "$name" -n "$ns" --ignore-not-found=true
+                      fi
+                    done
+
+                  # 2) Delete stale Pending pods older than 1h (skip system namespaces).
+                  kubectl get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.status.phase}{"|"}{.metadata.creationTimestamp}{"\n"}{end}' \
+                  | while IFS='|' read -r ns name phase created; do
+                      case "$ns" in
+                        kube-system|kube-public|kube-node-lease) continue ;;
+                      esac
+                      [ "$phase" = "Pending" ] || continue
+                      created_epoch="$(date -u -d "$created" +%s 2>/dev/null || echo 0)"
+                      [ "$created_epoch" -eq 0 ] && continue
+                      if [ "$created_epoch" -lt "$cutoff_pending_epoch" ]; then
+                        kubectl delete pod "$name" -n "$ns" --ignore-not-found=true
+                      fi
+                    done
+
+                  # 3) Delete stale Karpenter NodeClaims older than 1h with no node assigned.
+                  kubectl get nodeclaims -o jsonpath='{range .items[*]}{.metadata.name}{"|"}{.metadata.creationTimestamp}{"|"}{.status.nodeName}{"\n"}{end}' 2>/dev/null \
+                  | while IFS='|' read -r name created node_name; do
+                      [ -z "$name" ] && continue
+                      [ -n "$node_name" ] && continue
+                      created_epoch="$(date -u -d "$created" +%s 2>/dev/null || echo 0)"
+                      [ "$created_epoch" -eq 0 ] && continue
+                      if [ "$created_epoch" -lt "$cutoff_pending_epoch" ]; then
+                        kubectl delete nodeclaim "$name" --ignore-not-found=true
+                      fi
+                    done

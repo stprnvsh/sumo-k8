@@ -1,7 +1,22 @@
 # SUMO-K8 Project Structure
 
-**Last Updated**: 2025-11-09  
+**Last Updated**: 2026-04-14  
 **Status**: Phase 1 Complete - Core API Implemented
+
+---
+
+## Recent Updates
+
+- Added `k8s/stale-simulations-cleanup-cronjob.yaml` to remove stale `sim-*` jobs older than 12 hours across namespaces.
+- Extended `k8s/stale-simulations-cleanup-cronjob.yaml` to also remove stale Pending pods (>2h) and stale Karpenter NodeClaims with no node (>2h), excluding system namespaces.
+- Tightened stale Pending pod and stale Karpenter NodeClaim cleanup thresholds from 2h to 1h.
+- Added cleanup for `sim-*` jobs older than 1h with zero pods (handles repeated `FailedCreate` jobs).
+- Added `k8s/pdb-sumo-k8-controller.yaml` (minAvailable=1) and kept `sumo-k8-controller` at 1 replica due current single-node infra capacity.
+- Scaled infrastructure nodegroup to 2 nodes and set `sumo-k8-controller` back to 2 replicas.
+- Upgraded Karpenter control plane to `1.11.1` using staged CRD migration.
+- Switched to middle-cost runtime profile: `infrastructure-nodes` min=1 desired=1 max=3 and `sumo-k8-controller` replicas=1.
+- Updated `k8s/karpenter-nodepool-simulation.yaml` to set simulation node expiration to 12 hours.
+- Updated `k8s/configmap.yaml` to set `MAX_JOB_DURATION_HOURS` to 12.
 
 ---
 
