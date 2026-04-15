@@ -24,6 +24,7 @@ data:
   RESULT_STORAGE_TYPE: "s3"
   S3_BUCKET: "transcality-simulations"
   S3_REGION: "eu-central-2"
+  CLOUDWATCH_SIM_LOG_GROUP: "/sumo-k8/simulations"
   # Background workers
   ENABLE_RECONCILER: "true"
   ENABLE_CONFIGMAP_CLEANUP: "true"

@@ -46,6 +46,7 @@ S3_BUCKET = os.getenv("S3_BUCKET", "")
 S3_REGION = os.getenv("S3_REGION", "eu-central-2")
 AWS_REGION = os.getenv("AWS_REGION", S3_REGION)
 S3_IAM_ROLE_ARN = os.getenv("S3_IAM_ROLE_ARN", "")  # IAM role for IRSA
+CLOUDWATCH_SIM_LOG_GROUP = os.getenv("CLOUDWATCH_SIM_LOG_GROUP", "/sumo-k8/simulations")
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 AZURE_STORAGE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT", "")
 AZURE_CONTAINER = os.getenv("AZURE_CONTAINER", "")

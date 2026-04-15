@@ -18,6 +18,7 @@ from .config import (
     SUMO_IMAGE,
     S3_BUCKET,
     S3_REGION,
+    CLOUDWATCH_SIM_LOG_GROUP,
     SIMULATION_NODE_SELECTOR_KEY,
     SIMULATION_NODE_SELECTOR_VALUES,
     QUEUE_S3_PREFIX,
@@ -380,7 +381,84 @@ if [ -z "$CONFIG_FILE" ]; then
   echo "No .sumocfg found"
   exit 1
 fi
-sumo -c "$CONFIG_FILE"
+python3 - <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import boto3
+
+job_id = os.getenv("JOB_ID", "")
+tenant_id = os.getenv("TENANT_ID", "")
+config_file = os.environ["CONFIG_FILE"]
+region = os.getenv("S3_REGION") or None
+group = os.getenv("CLOUDWATCH_SIM_LOG_GROUP", "").strip()
+stream = f"{tenant_id}/{job_id}" if job_id else f"{tenant_id}/unknown"
+
+logs_client = None
+if group:
+    logs_client = boto3.client("logs", region_name=region)
+    try:
+        logs_client.create_log_group(logGroupName=group)
+    except logs_client.exceptions.ResourceAlreadyExistsException:
+        pass
+    except Exception:
+        logs_client = None
+    if logs_client:
+        try:
+            logs_client.create_log_stream(logGroupName=group, logStreamName=stream)
+        except logs_client.exceptions.ResourceAlreadyExistsException:
+            pass
+        except Exception:
+            logs_client = None
+
+step_re = re.compile(r"Step #\\s*([0-9]+(?:\\.[0-9]+)?)")
+
+def emit(event_type, message, step=None):
+    payload = {
+        "event": event_type,
+        "job_id": job_id,
+        "tenant_id": tenant_id,
+        "step": step,
+        "message": message,
+        "ts": int(time.time()),
+    }
+    line = json.dumps(payload, separators=(",", ":"))
+    print(line, flush=True)
+    if not logs_client:
+        return
+    try:
+        logs_client.put_log_events(
+            logGroupName=group,
+            logStreamName=stream,
+            logEvents=[{"timestamp": int(time.time() * 1000), "message": line}],
+        )
+    except Exception:
+        pass
+
+emit("sumo_start", "starting sumo")
+proc = subprocess.Popen(
+    ["sumo", "-c", config_file, "--step-log.period", "900"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+    bufsize=1,
+)
+for raw in proc.stdout:
+    line = raw.rstrip("\\n")
+    m = step_re.search(line)
+    if m:
+        emit("sumo_progress", line, m.group(1))
+    else:
+        print(line, flush=True)
+code = proc.wait()
+if code != 0:
+    emit("sumo_exit", f"sumo exited with code {code}")
+    sys.exit(code)
+emit("sumo_complete", "sumo completed")
+PY
 python3 /scripts/upload_results.py
 """
 
@@ -395,6 +473,8 @@ python3 /scripts/upload_results.py
     if queue_key:
         container_env.append(client.V1EnvVar(name="QUEUE_S3_BUCKET", value=S3_BUCKET))
         container_env.append(client.V1EnvVar(name="QUEUE_S3_KEY", value=queue_key))
+    if CLOUDWATCH_SIM_LOG_GROUP:
+        container_env.append(client.V1EnvVar(name="CLOUDWATCH_SIM_LOG_GROUP", value=CLOUDWATCH_SIM_LOG_GROUP))
 
     # Add S3 environment variables for direct upload/input fetch
     storage_type = detect_storage_type()
