@@ -696,6 +696,7 @@ def get_job_status(job_id: str, tenant_id: str):
             "submitted_at": job["submitted_at"].isoformat() if job["submitted_at"] else None,
             "started_at": None,
             "finished_at": None,
+            "estimated_cost_usd": None,
         }
 
     # Try to get live status from K8s
@@ -720,14 +721,17 @@ def get_job_status(job_id: str, tenant_id: str):
     if isinstance(rf, dict):
         error_message = rf.get("error_message")
 
-    return {
+    ec = job.get("estimated_cost_usd")
+    out = {
         "job_id": job_id,
         "status": status,
         "submitted_at": job['submitted_at'].isoformat() if job['submitted_at'] else None,
         "started_at": job['started_at'].isoformat() if job['started_at'] else None,
         "finished_at": job['finished_at'].isoformat() if job['finished_at'] else None,
         "error": error_message,
+        "estimated_cost_usd": float(ec) if ec is not None else None,
     }
+    return out
 
 def get_job_logs(job_id: str, tenant_id: str, namespace: str, k8s_job_name: str):
     """Get job logs"""

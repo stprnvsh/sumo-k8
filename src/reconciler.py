@@ -14,6 +14,7 @@ from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
 from .jobs import dispatch_queued_jobs
 from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
+from .cost import refresh_job_estimated_cost
 from .config import (
     AWS_REGION,
     ENABLE_LEGACY_CONFIGMAP_SWEEPER,
@@ -247,7 +248,8 @@ def sync_job_status():
                 storage_type = detect_storage_type()
                 # First, backfill missing timestamps for completed jobs
                 cur.execute(
-                    """SELECT job_id, k8s_job_name, k8s_namespace, status, started_at, finished_at
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, started_at, finished_at,
+                              cpu_request, memory_gi
                        FROM jobs 
                        WHERE status IN ('SUCCEEDED', 'FAILED') 
                        AND (started_at IS NULL OR finished_at IS NULL)
@@ -278,6 +280,7 @@ def sync_job_status():
                                 f"UPDATE jobs SET {', '.join(updates)} WHERE job_id = %s",
                                 tuple(params)
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             logger.info(f"Backfilled timestamps for job {job['job_id']}")
                     except client.exceptions.ApiException as e:
@@ -294,6 +297,7 @@ def sync_job_status():
                                     f"UPDATE jobs SET {', '.join(updates)} WHERE job_id = %s",
                                     (job['job_id'],)
                                 )
+                                refresh_job_estimated_cost(update_cur, job["job_id"])
                                 conn.commit()
                                 logger.info(f"Backfilled timestamps for deleted job {job['job_id']}")
                         else:
@@ -380,7 +384,7 @@ def sync_job_status():
                 # but direct S3 upload completed successfully.
                 if storage_type == "s3":
                     cur.execute(
-                        """SELECT job_id, k8s_namespace
+                        """SELECT job_id, k8s_namespace, cpu_request, memory_gi
                            FROM jobs
                            WHERE status = 'FAILED'
                            AND result_location IS NULL
@@ -413,6 +417,7 @@ def sync_job_status():
                                     job['job_id'],
                                 )
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             logger.info(f"Repaired FAILED->SUCCEEDED for job {job['job_id']} based on S3 results")
                         except Exception as e:
@@ -420,7 +425,8 @@ def sync_job_status():
                 
                 # Then process active jobs
                 cur.execute(
-                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data,
+                              cpu_request, memory_gi
                        FROM jobs
                        WHERE status IN ('PENDING', 'RUNNING')
                        ORDER BY submitted_at DESC
@@ -526,6 +532,7 @@ def sync_job_status():
                                        WHERE job_id = %s""",
                                     (new_status, result_location, result_files, job['job_id'])
                                 )
+                                refresh_job_estimated_cost(update_cur, job["job_id"])
                                 # Schedule ConfigMap cleanup
                                 cleanup_configmaps(job['k8s_namespace'], str(job['job_id']), delay_seconds=0)
                                 callback_error = None
@@ -585,6 +592,7 @@ def sync_job_status():
                                    WHERE job_id = %s""",
                                 (new_status, result_location, result_files, job['job_id'])
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             callback_error = None
                             if new_status == "FAILED":
