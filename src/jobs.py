@@ -576,6 +576,11 @@ async def submit_job(
     sumo_files_s3_url: str | None = None,
     sumo_files_s3_urls: list[str] | None = None,
     task_token: str | None = None,
+    progress_webhook_url: str | None = None,
+    progress_simulation_id: int | None = None,
+    progress_start_sec: int | None = None,
+    progress_end_sec: int | None = None,
+    premium_sim: bool | None = None,
 ):
     """Submit a SUMO simulation job"""
     # Validate resource request
@@ -639,6 +644,11 @@ async def submit_job(
                             "queue_s3_key": queue_key,
                             "s3_file_urls": s3_url_list if has_s3_urls else None,
                             "task_token": task_token,
+                            "progress_webhook_url": (str(progress_webhook_url).strip() if progress_webhook_url else None),
+                            "progress_simulation_id": int(progress_simulation_id) if progress_simulation_id is not None else None,
+                            "progress_start_sec": int(progress_start_sec) if progress_start_sec is not None else None,
+                            "progress_end_sec": int(progress_end_sec) if progress_end_sec is not None else None,
+                            "premium_sim": bool(premium_sim) if premium_sim is not None else None,
                         }
                     ),
                     cpu_request,

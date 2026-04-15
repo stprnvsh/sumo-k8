@@ -14,3 +14,9 @@
 - Updated `src/jobs.py` queue path to support list-based S3 inputs:
   - Stores `s3_file_urls` in `scenario_data`
   - Defers zip assembly to queued dispatch (`_dispatch_one_queued`) via `_build_zip_from_s3_urls(...)` instead of blocking submit request.
+- Added webhook progress metadata plumbing for `/jobs/s3` in `app.py` and `src/jobs.py`:
+  - Accepts/stores `progress_webhook_url`, `progress_simulation_id`, `progress_start_sec`, `progress_end_sec`, `premium_sim` in `scenario_data`.
+- Added running-step progress webhook integration in `src/reconciler.py`:
+  - Parses latest `sumo_progress` step from pod JSON logs.
+  - Computes progress percent from `(step - start_sec) / (end_sec - start_sec)`.
+  - Sends throttled webhook updates (only on percent increase) with `status_type=progress`, `simulation_status=Running`.

@@ -199,6 +199,11 @@ async def submit_job_s3_endpoint(
             detail="Provide exactly one input: sumo_files_s3_url or sumo_files_s3_urls",
         )
     task_token = payload.get("task_token")
+    progress_webhook_url = payload.get("progress_webhook_url")
+    progress_simulation_id = payload.get("progress_simulation_id")
+    progress_start_sec = payload.get("progress_start_sec")
+    progress_end_sec = payload.get("progress_end_sec")
+    premium_sim = payload.get("premium_sim")
     tenant = get_tenant_from_header(authorization)
     return await submit_job(
         tenant,
@@ -209,6 +214,11 @@ async def submit_job_s3_endpoint(
         sumo_files_s3_url=sumo_files_s3_url if has_s3_url else None,
         sumo_files_s3_urls=sumo_files_s3_urls if has_s3_urls else None,
         task_token=task_token,
+        progress_webhook_url=progress_webhook_url,
+        progress_simulation_id=progress_simulation_id,
+        progress_start_sec=progress_start_sec,
+        progress_end_sec=progress_end_sec,
+        premium_sim=premium_sim,
     )
 
 @app.get("/jobs/{job_id}")

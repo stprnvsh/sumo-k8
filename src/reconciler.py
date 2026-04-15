@@ -3,6 +3,8 @@ import time
 import logging
 import os
 import json
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta
 from kubernetes import client
 import boto3
@@ -23,6 +25,7 @@ from .config import (
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
+_LAST_PROGRESS_SENT: dict[str, int] = {}
 
 
 def _send_stepfunctions_callback(job, status: str, result_location=None, result_files=None, error_message=None):
@@ -110,6 +113,86 @@ def _job_pod_phase_running(namespace: str, k8s_job_name: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _to_int_or_none(value):
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_latest_sumo_step(namespace: str, k8s_job_name: str):
+    """Read latest numeric SUMO step from pod JSON logs (event=sumo_progress)."""
+    try:
+        pods = k8s_core.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=f"job-name={k8s_job_name}",
+        )
+        if not pods.items:
+            return None
+        pod_name = pods.items[0].metadata.name
+        logs = k8s_core.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=namespace,
+            tail_lines=400,
+        )
+        latest_step = None
+        for line in (logs or "").splitlines():
+            text = (line or "").strip()
+            if not text.startswith("{"):
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception:
+                continue
+            if payload.get("event") != "sumo_progress":
+                continue
+            try:
+                step = float(payload.get("step"))
+            except Exception:
+                continue
+            if latest_step is None or step > latest_step:
+                latest_step = step
+        return latest_step
+    except Exception:
+        return None
+
+
+def _send_progress_webhook(job, percent: int, step: float):
+    scenario = job.get("scenario_data") or {}
+    if isinstance(scenario, str):
+        try:
+            scenario = json.loads(scenario)
+        except Exception:
+            scenario = {}
+    webhook_url = (scenario.get("progress_webhook_url") or "").strip()
+    simulation_id = scenario.get("progress_simulation_id")
+    if not webhook_url or simulation_id is None:
+        return
+
+    payload = {
+        "simulation_id": int(simulation_id),
+        "status_type": "progress",
+        "simulation_status": "Running",
+        "advanced_status": "Not Started",
+        "message": f"Simulation progress: {percent}% (step {int(step)})",
+    }
+    token = (os.getenv("WEBHOOK_SHARED_TOKEN") or "").strip()
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url=webhook_url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("X-Webhook-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            return
+    except urllib.error.HTTPError as e:
+        logger.warning("Progress webhook HTTP %s for job %s", e.code, job.get("job_id"))
+    except Exception as e:
+        logger.warning("Progress webhook failed for job %s: %s", job.get("job_id"), e)
 
 
 def sync_job_status():
@@ -309,6 +392,13 @@ def sync_job_status():
                 
                 for job in jobs:
                     try:
+                        job_id_str = str(job["job_id"])
+                        scenario = job.get("scenario_data") or {}
+                        if isinstance(scenario, str):
+                            try:
+                                scenario = json.loads(scenario)
+                            except Exception:
+                                scenario = {}
                         k8s_job = k8s_batch.read_namespaced_job(job['k8s_job_name'], job['k8s_namespace'])
                         new_status = job['status']
                         
@@ -329,6 +419,19 @@ def sync_job_status():
                             new_status = "RUNNING"
                         elif new_status == "RUNNING" and not running_pod:
                             new_status = "PENDING"
+
+                        if (new_status == "RUNNING" or (job["status"] == "RUNNING" and running_pod)):
+                            start_sec = _to_int_or_none(scenario.get("progress_start_sec"))
+                            end_sec = _to_int_or_none(scenario.get("progress_end_sec"))
+                            if start_sec is not None and end_sec is not None and end_sec > start_sec:
+                                step = _extract_latest_sumo_step(job["k8s_namespace"], job["k8s_job_name"])
+                                if step is not None:
+                                    raw = ((float(step) - float(start_sec)) * 100.0) / float(end_sec - start_sec)
+                                    percent = max(0, min(100, int(raw)))
+                                    last_sent = _LAST_PROGRESS_SENT.get(job_id_str, -1)
+                                    if percent > last_sent:
+                                        _send_progress_webhook(job, percent, step)
+                                        _LAST_PROGRESS_SENT[job_id_str] = percent
 
                         if new_status != job['status']:
                             update_cur = conn.cursor()
@@ -401,6 +504,8 @@ def sync_job_status():
                                 )
                             conn.commit()
                             logger.info(f"Updated job {job['job_id']} status: {job['status']} -> {new_status}")
+                            if new_status in ("SUCCEEDED", "FAILED"):
+                                _LAST_PROGRESS_SENT.pop(job_id_str, None)
                     except client.exceptions.ApiException as e:
                         if e.status == 404:
                             # If the K8s Job has already been deleted but results exist in S3,
@@ -451,6 +556,7 @@ def sync_job_status():
                                 error_message=callback_error,
                             )
                             logger.warning(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
+                            _LAST_PROGRESS_SENT.pop(job_id_str, None)
                         else:
                             logger.error(f"Failed to sync job {job['job_id']}: {e}")
                     except Exception as e:

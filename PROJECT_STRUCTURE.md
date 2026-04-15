@@ -18,6 +18,7 @@
 - Enforced infra workload AZ pinning to `eu-central-2a` for `sumo-k8-controller`, `postgres`, `queue-dashboard-api`, and `queue-dashboard-web`.
 - Removed controller-side ZIP/ConfigMap payload packaging for queued dispatch; job pods now fetch scenario files directly from `s3_file_urls` at runtime.
 - Kept controller at `uvicorn --workers 1` so reconciler/cleanup startup hooks run once per pod.
+- Added per-simulation CloudWatch progress logging from SUMO step-log (`/sumo-k8/simulations` log group, stream `tenant_id/job_id`).
 - Updated `k8s/karpenter-nodepool-simulation.yaml` to set simulation node expiration to 12 hours.
 - Updated `k8s/configmap.yaml` to set `MAX_JOB_DURATION_HOURS` to 12.
 
