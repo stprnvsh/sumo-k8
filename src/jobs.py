@@ -414,7 +414,7 @@ if group:
         except Exception:
             logs_client = None
 
-step_re = re.compile(r"Step #\\s*([0-9]+(?:\\.[0-9]+)?)")
+step_re = re.compile(r"Step #\s*([0-9]+(?:\.[0-9]+)?)")
 
 def emit(event_type, message, step=None):
     payload = {

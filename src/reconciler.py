@@ -3,6 +3,7 @@ import time
 import logging
 import os
 import json
+import ssl
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
@@ -161,7 +162,7 @@ def _extract_latest_sumo_step(namespace: str, k8s_job_name: str):
         return None
 
 
-def _send_progress_webhook(job, percent: int, step: float):
+def _send_progress_webhook(job, percent: int, step: float) -> bool:
     scenario = job.get("scenario_data") or {}
     if isinstance(scenario, str):
         try:
@@ -171,7 +172,13 @@ def _send_progress_webhook(job, percent: int, step: float):
     webhook_url = (scenario.get("progress_webhook_url") or "").strip()
     simulation_id = scenario.get("progress_simulation_id")
     if not webhook_url or simulation_id is None:
-        return
+        logger.warning(
+            "Progress webhook config missing for job %s (url=%s, simulation_id=%s)",
+            job.get("job_id"),
+            bool(webhook_url),
+            simulation_id,
+        )
+        return False
 
     payload = {
         "simulation_id": int(simulation_id),
@@ -188,11 +195,42 @@ def _send_progress_webhook(job, percent: int, step: float):
         req.add_header("X-Webhook-Token", token)
     try:
         with urllib.request.urlopen(req, timeout=10):
-            return
+            return True
     except urllib.error.HTTPError as e:
         logger.warning("Progress webhook HTTP %s for job %s", e.code, job.get("job_id"))
+        return False
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        allow_insecure = str(os.getenv("PROGRESS_WEBHOOK_INSECURE_TLS", "true")).lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        if allow_insecure and isinstance(reason, ssl.SSLCertVerificationError):
+            try:
+                with urllib.request.urlopen(
+                    req,
+                    timeout=10,
+                    context=ssl._create_unverified_context(),
+                ):
+                    logger.warning(
+                        "Progress webhook sent insecurely for job %s after cert verification failure",
+                        job.get("job_id"),
+                    )
+                    return True
+            except Exception as retry_exc:
+                logger.warning(
+                    "Progress webhook insecure retry failed for job %s: %s",
+                    job.get("job_id"),
+                    retry_exc,
+                )
+                return False
+        logger.warning("Progress webhook failed for job %s: %s", job.get("job_id"), e)
+        return False
     except Exception as e:
         logger.warning("Progress webhook failed for job %s: %s", job.get("job_id"), e)
+        return False
 
 
 def sync_job_status():
@@ -430,8 +468,13 @@ def sync_job_status():
                                     percent = max(0, min(100, int(raw)))
                                     last_sent = _LAST_PROGRESS_SENT.get(job_id_str, -1)
                                     if percent > last_sent:
-                                        _send_progress_webhook(job, percent, step)
-                                        _LAST_PROGRESS_SENT[job_id_str] = percent
+                                        if _send_progress_webhook(job, percent, step):
+                                            _LAST_PROGRESS_SENT[job_id_str] = percent
+                                else:
+                                    # Ensure at least one running progress webhook is emitted.
+                                    if _LAST_PROGRESS_SENT.get(job_id_str, -1) < 0:
+                                        if _send_progress_webhook(job, 0, float(start_sec)):
+                                            _LAST_PROGRESS_SENT[job_id_str] = 0
 
                         if new_status != job['status']:
                             update_cur = conn.cursor()
@@ -625,7 +668,7 @@ def cleanup_old_configmaps():
                             f"SELECT job_id::text FROM jobs WHERE job_id IN ({placeholders})",
                             tuple(job_ids),
                         )
-                        existing_job_ids = {row[0] for row in cur.fetchall()}
+                        existing_job_ids = {row["job_id"] for row in cur.fetchall()}
 
                     for cm_name, job_id in candidates:
                         if job_id in existing_job_ids:
