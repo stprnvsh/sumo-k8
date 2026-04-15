@@ -28,6 +28,7 @@ spec:
     spec:
       nodeSelector:
         eks.amazonaws.com/nodegroup: infrastructure-nodes
+        topology.kubernetes.io/zone: eu-central-2a
       containers:
       - name: postgres
         image: postgres:14-alpine

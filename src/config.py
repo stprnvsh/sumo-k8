@@ -43,7 +43,8 @@ RESULT_STORAGE_SIZE_GI = int(os.getenv("RESULT_STORAGE_SIZE_GI", "10"))
 
 # Object storage (cloud)
 S3_BUCKET = os.getenv("S3_BUCKET", "")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_REGION = os.getenv("S3_REGION", "eu-central-2")
+AWS_REGION = os.getenv("AWS_REGION", S3_REGION)
 S3_IAM_ROLE_ARN = os.getenv("S3_IAM_ROLE_ARN", "")  # IAM role for IRSA
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 AZURE_STORAGE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT", "")

@@ -1,14 +1,18 @@
 """Background job status reconciler"""
 import time
 import logging
+import os
+import json
 from datetime import datetime, timedelta
 from kubernetes import client
+import boto3
 from .database import get_db
 from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
 from .jobs import dispatch_queued_jobs
 from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
 from .config import (
+    AWS_REGION,
     ENABLE_LEGACY_CONFIGMAP_SWEEPER,
     LEGACY_CONFIGMAP_SWEEPER_NAMESPACES,
     LEGACY_CONFIGMAP_SWEEPER_PREFIX,
@@ -19,6 +23,39 @@ from .config import (
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
+
+
+def _send_stepfunctions_callback(job, status: str, result_location=None, result_files=None, error_message=None):
+    scenario = job.get("scenario_data") or {}
+    if isinstance(scenario, str):
+        try:
+            scenario = json.loads(scenario)
+        except Exception:
+            scenario = {}
+    task_token = scenario.get("task_token")
+    if not task_token:
+        return
+    if hasattr(result_files, "adapted"):
+        result_files = result_files.adapted
+    client_sfn = boto3.client("stepfunctions", region_name=AWS_REGION or os.getenv("AWS_REGION"))
+    try:
+        if status == "SUCCEEDED":
+            output = {
+                "job_id": str(job["job_id"]),
+                "status": status,
+                "result_location": result_location,
+                "result_files": result_files if isinstance(result_files, dict) else {},
+            }
+            client_sfn.send_task_success(taskToken=task_token, output=json.dumps(output))
+        else:
+            client_sfn.send_task_failure(
+                taskToken=task_token,
+                error="SUMOK8JobFailed",
+                cause=(error_message or "SUMO-K8 job failed")[:32768],
+            )
+        logger.info(f"StepFunctions callback sent for job {job['job_id']} ({status})")
+    except Exception as e:
+        logger.error(f"Failed StepFunctions callback for job {job['job_id']}: {e}")
 
 def _extract_failure_info(namespace: str, k8s_job_name: str):
     """Best-effort failure diagnostics to persist in DB."""
@@ -262,7 +299,7 @@ def sync_job_status():
                 
                 # Then process active jobs
                 cur.execute(
-                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data
                        FROM jobs
                        WHERE status IN ('PENDING', 'RUNNING')
                        ORDER BY submitted_at DESC
@@ -345,6 +382,18 @@ def sync_job_status():
                                 )
                                 # Schedule ConfigMap cleanup
                                 cleanup_configmaps(job['k8s_namespace'], str(job['job_id']), delay_seconds=0)
+                                callback_error = None
+                                if new_status == "FAILED":
+                                    rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
+                                    if isinstance(rf, dict):
+                                        callback_error = rf.get("error_message")
+                                _send_stepfunctions_callback(
+                                    job,
+                                    new_status,
+                                    result_location=result_location,
+                                    result_files=result_files,
+                                    error_message=callback_error,
+                                )
                             else:
                                 update_cur.execute(
                                     "UPDATE jobs SET status = %s WHERE job_id = %s",
@@ -389,6 +438,18 @@ def sync_job_status():
                                 (new_status, result_location, result_files, job['job_id'])
                             )
                             conn.commit()
+                            callback_error = None
+                            if new_status == "FAILED":
+                                rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
+                                if isinstance(rf, dict):
+                                    callback_error = rf.get("error_message")
+                            _send_stepfunctions_callback(
+                                job,
+                                new_status,
+                                result_location=result_location,
+                                result_files=result_files,
+                                error_message=callback_error,
+                            )
                             logger.warning(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
                         else:
                             logger.error(f"Failed to sync job {job['job_id']}: {e}")

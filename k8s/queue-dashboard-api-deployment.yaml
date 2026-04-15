@@ -17,6 +17,7 @@ spec:
     spec:
       nodeSelector:
         eks.amazonaws.com/nodegroup: infrastructure-nodes
+        topology.kubernetes.io/zone: eu-central-2a
       containers:
       - name: api
         image: 154794777636.dkr.ecr.eu-central-2.amazonaws.com/queue-dashboard-api:queue-dashboard-20260330153330-amd64

@@ -5,7 +5,7 @@ import sys
 import threading
 import logging
 from datetime import datetime
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -164,6 +164,7 @@ async def submit_job_endpoint(
     memory_gi: int = Form(4, ge=1, le=128),
     sumo_files: UploadFile | None = File(None),
     sumo_files_s3_url: str | None = Form(None),
+    task_token: str | None = Form(None),
     authorization: str = Header(None, alias="Authorization")
 ):
     """Submit a SUMO simulation job"""
@@ -175,6 +176,39 @@ async def submit_job_endpoint(
         memory_gi,
         sumo_files=sumo_files,
         sumo_files_s3_url=sumo_files_s3_url,
+        task_token=task_token,
+    )
+
+@app.post("/jobs/s3")
+async def submit_job_s3_endpoint(
+    payload: dict = Body(...),
+    authorization: str = Header(None, alias="Authorization"),
+):
+    scenario_id = str(payload.get("scenario_id", "")).strip()
+    if not scenario_id:
+        raise HTTPException(status_code=400, detail="scenario_id is required")
+    cpu_request = int(payload.get("cpu_request", 2))
+    memory_gi = int(payload.get("memory_gi", 4))
+    sumo_files_s3_url = str(payload.get("sumo_files_s3_url", "")).strip()
+    sumo_files_s3_urls = payload.get("sumo_files_s3_urls")
+    has_s3_url = bool(sumo_files_s3_url)
+    has_s3_urls = isinstance(sumo_files_s3_urls, list) and len(sumo_files_s3_urls) > 0
+    if has_s3_url == has_s3_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one input: sumo_files_s3_url or sumo_files_s3_urls",
+        )
+    task_token = payload.get("task_token")
+    tenant = get_tenant_from_header(authorization)
+    return await submit_job(
+        tenant,
+        scenario_id,
+        cpu_request,
+        memory_gi,
+        sumo_files=None,
+        sumo_files_s3_url=sumo_files_s3_url if has_s3_url else None,
+        sumo_files_s3_urls=sumo_files_s3_urls if has_s3_urls else None,
+        task_token=task_token,
     )
 
 @app.get("/jobs/{job_id}")
