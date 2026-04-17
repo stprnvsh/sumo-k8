@@ -15,6 +15,7 @@ data:
   DEFAULT_MAX_MEMORY_GI: "128"
   SIMULATION_NODE_SELECTOR_KEY: "node-type"
   SIMULATION_NODE_SELECTOR_VALUES: "simulation"
+  SIMULATION_PREFERRED_ZONES: "eu-central-2c,eu-central-2a,eu-central-2b"
   CORS_ORIGINS: "*"
   # Admin key for warmup/scaling endpoints
   ADMIN_KEY: "admin-75b4c6ed101a0d11b5efd8953c521cb87a17875ccbf77395911321a005855a68"

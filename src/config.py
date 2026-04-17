@@ -71,6 +71,9 @@ SIMULATION_NODE_SELECTOR_KEY = os.getenv("SIMULATION_NODE_SELECTOR_KEY", "node-t
 SIMULATION_NODE_SELECTOR_VALUES = [
     v.strip() for v in os.getenv("SIMULATION_NODE_SELECTOR_VALUES", "simulation").split(",") if v.strip()
 ]
+SIMULATION_PREFERRED_ZONES = [
+    v.strip() for v in os.getenv("SIMULATION_PREFERRED_ZONES", "").split(",") if v.strip()
+]
 
 # Estimated compute cost: (cpu * rate + memory_gi * rate) * wall_clock_hours.
 # If JOB_COST_CPU_USD_PER_HOUR and JOB_COST_MEMORY_GIB_USD_PER_HOUR are both 0, and

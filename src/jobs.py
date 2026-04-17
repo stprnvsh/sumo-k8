@@ -21,6 +21,7 @@ from .config import (
     CLOUDWATCH_SIM_LOG_GROUP,
     SIMULATION_NODE_SELECTOR_KEY,
     SIMULATION_NODE_SELECTOR_VALUES,
+    SIMULATION_PREFERRED_ZONES,
     QUEUE_S3_PREFIX,
     MAX_QUEUED_JOBS_PER_TENANT,
 )
@@ -513,6 +514,32 @@ python3 /scripts/upload_results.py
                     )
                 )
             )
+    if SIMULATION_PREFERRED_ZONES:
+        preferred = [
+            client.V1PreferredSchedulingTerm(
+                weight=max(1, len(SIMULATION_PREFERRED_ZONES) - idx),
+                preference=client.V1NodeSelectorTerm(
+                    match_expressions=[
+                        client.V1NodeSelectorRequirement(
+                            key="topology.kubernetes.io/zone",
+                            operator="In",
+                            values=[zone],
+                        )
+                    ]
+                ),
+            )
+            for idx, zone in enumerate(SIMULATION_PREFERRED_ZONES)
+        ]
+        if affinity is None:
+            affinity = client.V1Affinity(
+                node_affinity=client.V1NodeAffinity(
+                    preferred_during_scheduling_ignored_during_execution=preferred
+                )
+            )
+        else:
+            if affinity.node_affinity is None:
+                affinity.node_affinity = client.V1NodeAffinity()
+            affinity.node_affinity.preferred_during_scheduling_ignored_during_execution = preferred
 
     # Create Kubernetes Job
     job_manifest = client.V1Job(
