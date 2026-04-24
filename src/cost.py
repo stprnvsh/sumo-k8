@@ -3,8 +3,12 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any, Optional
+import logging
 
 from .cost_aws import get_job_cost_rates
+
+logger = logging.getLogger(__name__)
+_MISSING_COST_COLUMN_LOGGED = False
 
 
 def _normalize_dt(dt: Any) -> Optional[datetime]:
@@ -45,6 +49,7 @@ def estimated_cost_usd(
 
 
 def refresh_job_estimated_cost(cur, job_id) -> None:
+    global _MISSING_COST_COLUMN_LOGGED
     cur.execute(
         """SELECT cpu_request, memory_gi, started_at, finished_at
            FROM jobs WHERE job_id = %s""",
@@ -59,7 +64,17 @@ def refresh_job_estimated_cost(cur, job_id) -> None:
         row["started_at"],
         row["finished_at"],
     )
-    cur.execute(
-        "UPDATE jobs SET estimated_cost_usd = %s WHERE job_id = %s",
-        (cost, job_id),
-    )
+    try:
+        cur.execute(
+            "UPDATE jobs SET estimated_cost_usd = %s WHERE job_id = %s",
+            (cost, job_id),
+        )
+    except Exception as exc:
+        msg = str(exc).lower()
+        pgcode = getattr(exc, "pgcode", None)
+        if pgcode == "42703" or "estimated_cost_usd" in msg:
+            if not _MISSING_COST_COLUMN_LOGGED:
+                logger.warning("Skipping estimated cost update: jobs.estimated_cost_usd column missing")
+                _MISSING_COST_COLUMN_LOGGED = True
+            return
+        raise

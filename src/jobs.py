@@ -309,6 +309,7 @@ def _dispatch_one_queued(tenant_id: str) -> bool:
             config_file,
             queue_key=queue_key,
             s3_file_urls=s3_file_urls,
+            scenario=scenario,
         )
         cur.execute(
             "UPDATE jobs SET status = 'PENDING' WHERE job_id = %s",
@@ -325,6 +326,7 @@ def create_k8s_job(
     config_file: str,
     queue_key: str | None = None,
     s3_file_urls: list[str] | None = None,
+    scenario: dict | None = None,
 ):
     """Create Kubernetes Job that fetches files from S3 at runtime."""
     if not k8s_available:
@@ -389,6 +391,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 import boto3
 
 job_id = os.getenv("JOB_ID", "")
@@ -397,6 +400,11 @@ config_file = os.environ["CONFIG_FILE"]
 region = os.getenv("S3_REGION") or None
 group = os.getenv("CLOUDWATCH_SIM_LOG_GROUP", "").strip()
 stream = f"{tenant_id}/{job_id}" if job_id else f"{tenant_id}/unknown"
+progress_webhook_url = os.getenv("PROGRESS_WEBHOOK_URL", "").strip()
+progress_webhook_token = os.getenv("PROGRESS_WEBHOOK_TOKEN", "").strip()
+progress_simulation_id = os.getenv("PROGRESS_SIMULATION_ID", "").strip()
+progress_start_sec = os.getenv("PROGRESS_START_SEC", "").strip()
+progress_end_sec = os.getenv("PROGRESS_END_SEC", "").strip()
 
 logs_client = None
 if group:
@@ -416,6 +424,45 @@ if group:
             logs_client = None
 
 step_re = re.compile(r"Step #\s*([0-9]+(?:\.[0-9]+)?)")
+time_re = re.compile(r"time=([0-9]+(?:\.[0-9]+)?)")
+
+def _to_int(value):
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+start_sec = _to_int(progress_start_sec)
+end_sec = _to_int(progress_end_sec)
+sim_id = _to_int(progress_simulation_id)
+
+def _send_progress(step):
+    if not progress_webhook_url or sim_id is None:
+        return
+    if start_sec is None or end_sec is None or end_sec <= start_sec:
+        return
+    try:
+        percent = ((float(step) - float(start_sec)) * 100.0) / float(end_sec - start_sec)
+        percent = max(0.0, min(100.0, round(percent, 2)))
+        payload = {
+            "simulation_id": sim_id,
+            "status_type": "progress",
+            "simulation_status": "Running",
+            "advanced_status": "Not Started",
+            "message": f"Simulation progress: {percent}% (step {int(float(step))})",
+        }
+        req = urllib.request.Request(
+            url=progress_webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        if progress_webhook_token:
+            req.add_header("X-Webhook-Token", progress_webhook_token)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception:
+        pass
 
 def emit(event_type, message, step=None):
     payload = {
@@ -438,6 +485,8 @@ def emit(event_type, message, step=None):
         )
     except Exception:
         pass
+    if event_type == "sumo_progress" and step is not None:
+        _send_progress(step)
 
 emit("sumo_start", "starting sumo")
 proc = subprocess.Popen(
@@ -450,10 +499,16 @@ proc = subprocess.Popen(
 for raw in proc.stdout:
     line = raw.rstrip("\\n")
     m = step_re.search(line)
+    step_value = None
     if m:
-        emit("sumo_progress", line, m.group(1))
+        step_value = float(m.group(1))
     else:
-        print(line, flush=True)
+        tm = time_re.search(line)
+        if tm:
+            step_value = float(tm.group(1))
+    if step_value is not None:
+        emit("sumo_progress", line, step_value)
+    print(line, flush=True)
 code = proc.wait()
 if code != 0:
     emit("sumo_exit", f"sumo exited with code {code}")
@@ -476,6 +531,22 @@ python3 /scripts/upload_results.py
         container_env.append(client.V1EnvVar(name="QUEUE_S3_KEY", value=queue_key))
     if CLOUDWATCH_SIM_LOG_GROUP:
         container_env.append(client.V1EnvVar(name="CLOUDWATCH_SIM_LOG_GROUP", value=CLOUDWATCH_SIM_LOG_GROUP))
+    scenario = scenario or {}
+    progress_webhook_url = (scenario.get("progress_webhook_url") or "").strip()
+    if progress_webhook_url:
+        container_env.append(client.V1EnvVar(name="PROGRESS_WEBHOOK_URL", value=progress_webhook_url))
+    progress_simulation_id = scenario.get("progress_simulation_id")
+    if progress_simulation_id is not None:
+        container_env.append(client.V1EnvVar(name="PROGRESS_SIMULATION_ID", value=str(progress_simulation_id)))
+    progress_start_sec = scenario.get("progress_start_sec")
+    if progress_start_sec is not None:
+        container_env.append(client.V1EnvVar(name="PROGRESS_START_SEC", value=str(progress_start_sec)))
+    progress_end_sec = scenario.get("progress_end_sec")
+    if progress_end_sec is not None:
+        container_env.append(client.V1EnvVar(name="PROGRESS_END_SEC", value=str(progress_end_sec)))
+    progress_webhook_token = (os.getenv("WEBHOOK_SHARED_TOKEN", "") or "").strip()
+    if progress_webhook_token:
+        container_env.append(client.V1EnvVar(name="PROGRESS_WEBHOOK_TOKEN", value=progress_webhook_token))
 
     # Add S3 environment variables for direct upload/input fetch
     storage_type = detect_storage_type()
@@ -565,6 +636,7 @@ python3 /scripts/upload_results.py
                         client.V1Container(
                             name="sumo",
                             image=SUMO_IMAGE,
+                            image_pull_policy="Always",
                             command=["/bin/sh", "-c"],
                             args=[run_script],
                             resources=client.V1ResourceRequirements(
