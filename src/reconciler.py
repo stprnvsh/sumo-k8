@@ -9,11 +9,13 @@ import urllib.error
 from datetime import datetime, timedelta
 from kubernetes import client
 import boto3
+from botocore.exceptions import ClientError
 from .database import get_db
 from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
 from .jobs import dispatch_queued_jobs
 from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
+from .cost import refresh_job_estimated_cost
 from .config import (
     AWS_REGION,
     ENABLE_LEGACY_CONFIGMAP_SWEEPER,
@@ -26,7 +28,7 @@ from .config import (
 from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
-_LAST_PROGRESS_SENT: dict[str, int] = {}
+_LAST_PROGRESS_SENT: dict[str, float] = {}
 
 
 def _send_stepfunctions_callback(job, status: str, result_location=None, result_files=None, error_message=None):
@@ -38,7 +40,7 @@ def _send_stepfunctions_callback(job, status: str, result_location=None, result_
             scenario = {}
     task_token = scenario.get("task_token")
     if not task_token:
-        return
+        return "no_token"
     if hasattr(result_files, "adapted"):
         result_files = result_files.adapted
     client_sfn = boto3.client("stepfunctions", region_name=AWS_REGION or os.getenv("AWS_REGION"))
@@ -57,9 +59,37 @@ def _send_stepfunctions_callback(job, status: str, result_location=None, result_
                 error="SUMOK8JobFailed",
                 cause=(error_message or "SUMO-K8 job failed")[:32768],
             )
-        logger.info(f"StepFunctions callback sent for job {job['job_id']} ({status})")
+        logger.debug("StepFunctions callback sent for job %s (%s)", job["job_id"], status)
+        return "sent"
+    except ClientError as e:
+        code = (e.response or {}).get("Error", {}).get("Code", "")
+        if code in ("TaskTimedOut", "TaskDoesNotExist", "InvalidToken"):
+            logger.info(
+                "Skipping stale StepFunctions callback for job %s: %s",
+                job["job_id"],
+                code,
+            )
+            return "stale_token"
+        logger.warning("Failed StepFunctions callback for job %s: %s", job["job_id"], e)
+        return "error"
     except Exception as e:
-        logger.error(f"Failed StepFunctions callback for job {job['job_id']}: {e}")
+        logger.warning("Failed StepFunctions callback for job %s: %s", job["job_id"], e)
+        return "error"
+
+
+def _clear_task_token(cur, job_id):
+    cur.execute(
+        """
+        UPDATE jobs
+        SET scenario_data =
+            (
+                (COALESCE(scenario_data::jsonb, '{}'::jsonb) - 'task_token')
+                || '{"task_token_stale": true}'::jsonb
+            )
+        WHERE job_id = %s
+        """,
+        (job_id,),
+    )
 
 def _extract_failure_info(namespace: str, k8s_job_name: str):
     """Best-effort failure diagnostics to persist in DB."""
@@ -162,7 +192,13 @@ def _extract_latest_sumo_step(namespace: str, k8s_job_name: str):
         return None
 
 
-def _send_progress_webhook(job, percent: int, step: float) -> bool:
+def _format_progress_percent(percent: float) -> str:
+    if float(percent).is_integer():
+        return str(int(percent))
+    return f"{percent:.2f}".rstrip("0").rstrip(".")
+
+
+def _send_progress_webhook(job, percent: float, step: float) -> bool:
     scenario = job.get("scenario_data") or {}
     if isinstance(scenario, str):
         try:
@@ -172,7 +208,7 @@ def _send_progress_webhook(job, percent: int, step: float) -> bool:
     webhook_url = (scenario.get("progress_webhook_url") or "").strip()
     simulation_id = scenario.get("progress_simulation_id")
     if not webhook_url or simulation_id is None:
-        logger.warning(
+        logger.debug(
             "Progress webhook config missing for job %s (url=%s, simulation_id=%s)",
             job.get("job_id"),
             bool(webhook_url),
@@ -185,7 +221,7 @@ def _send_progress_webhook(job, percent: int, step: float) -> bool:
         "status_type": "progress",
         "simulation_status": "Running",
         "advanced_status": "Not Started",
-        "message": f"Simulation progress: {percent}% (step {int(step)})",
+        "message": f"Simulation progress: {_format_progress_percent(percent)}% (step {int(step)})",
     }
     token = (os.getenv("WEBHOOK_SHARED_TOKEN") or "").strip()
     data = json.dumps(payload).encode("utf-8")
@@ -233,6 +269,31 @@ def _send_progress_webhook(job, percent: int, step: float) -> bool:
         return False
 
 
+def _send_terminal_progress_if_needed(job, scenario: dict, new_status: str, job_id_str: str) -> None:
+    """Emit a final progress update for fast jobs that finish between poll cycles."""
+    start_sec = _to_int_or_none(scenario.get("progress_start_sec"))
+    end_sec = _to_int_or_none(scenario.get("progress_end_sec"))
+    if start_sec is None or end_sec is None or end_sec <= start_sec:
+        return
+
+    step = _extract_latest_sumo_step(job["k8s_namespace"], job["k8s_job_name"])
+    if step is None:
+        if new_status != "SUCCEEDED":
+            return
+        step = float(end_sec)
+
+    raw = ((float(step) - float(start_sec)) * 100.0) / float(end_sec - start_sec)
+    percent = max(0.0, min(100.0, round(raw, 2)))
+    if new_status == "SUCCEEDED":
+        percent = 100.0
+        step = max(float(step), float(end_sec))
+
+    last_sent = _LAST_PROGRESS_SENT.get(job_id_str, -1.0)
+    if percent > last_sent:
+        if _send_progress_webhook(job, percent, step):
+            _LAST_PROGRESS_SENT[job_id_str] = percent
+
+
 def sync_job_status():
     """Background reconciler to sync K8s job status with database"""
     while True:
@@ -247,7 +308,8 @@ def sync_job_status():
                 storage_type = detect_storage_type()
                 # First, backfill missing timestamps for completed jobs
                 cur.execute(
-                    """SELECT job_id, k8s_job_name, k8s_namespace, status, started_at, finished_at
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, started_at, finished_at,
+                              cpu_request, memory_gi
                        FROM jobs 
                        WHERE status IN ('SUCCEEDED', 'FAILED') 
                        AND (started_at IS NULL OR finished_at IS NULL)
@@ -278,6 +340,7 @@ def sync_job_status():
                                 f"UPDATE jobs SET {', '.join(updates)} WHERE job_id = %s",
                                 tuple(params)
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             logger.info(f"Backfilled timestamps for job {job['job_id']}")
                     except client.exceptions.ApiException as e:
@@ -294,6 +357,7 @@ def sync_job_status():
                                     f"UPDATE jobs SET {', '.join(updates)} WHERE job_id = %s",
                                     (job['job_id'],)
                                 )
+                                refresh_job_estimated_cost(update_cur, job["job_id"])
                                 conn.commit()
                                 logger.info(f"Backfilled timestamps for deleted job {job['job_id']}")
                         else:
@@ -380,7 +444,7 @@ def sync_job_status():
                 # but direct S3 upload completed successfully.
                 if storage_type == "s3":
                     cur.execute(
-                        """SELECT job_id, k8s_namespace
+                        """SELECT job_id, k8s_namespace, cpu_request, memory_gi
                            FROM jobs
                            WHERE status = 'FAILED'
                            AND result_location IS NULL
@@ -413,6 +477,7 @@ def sync_job_status():
                                     job['job_id'],
                                 )
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             logger.info(f"Repaired FAILED->SUCCEEDED for job {job['job_id']} based on S3 results")
                         except Exception as e:
@@ -420,7 +485,8 @@ def sync_job_status():
                 
                 # Then process active jobs
                 cur.execute(
-                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data
+                    """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data,
+                              cpu_request, memory_gi
                        FROM jobs
                        WHERE status IN ('PENDING', 'RUNNING')
                        ORDER BY submitted_at DESC
@@ -465,8 +531,8 @@ def sync_job_status():
                                 step = _extract_latest_sumo_step(job["k8s_namespace"], job["k8s_job_name"])
                                 if step is not None:
                                     raw = ((float(step) - float(start_sec)) * 100.0) / float(end_sec - start_sec)
-                                    percent = max(0, min(100, int(raw)))
-                                    last_sent = _LAST_PROGRESS_SENT.get(job_id_str, -1)
+                                    percent = max(0.0, min(100.0, round(raw, 2)))
+                                    last_sent = _LAST_PROGRESS_SENT.get(job_id_str, -1.0)
                                     if percent > last_sent:
                                         if _send_progress_webhook(job, percent, step):
                                             _LAST_PROGRESS_SENT[job_id_str] = percent
@@ -489,6 +555,7 @@ def sync_job_status():
                                     (new_status, job['job_id'])
                                 )
                             elif new_status in ("SUCCEEDED", "FAILED"):
+                                _send_terminal_progress_if_needed(job, scenario, new_status, job_id_str)
                                 # Store result location info
                                 storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
                                 
@@ -526,6 +593,7 @@ def sync_job_status():
                                        WHERE job_id = %s""",
                                     (new_status, result_location, result_files, job['job_id'])
                                 )
+                                refresh_job_estimated_cost(update_cur, job["job_id"])
                                 # Schedule ConfigMap cleanup
                                 cleanup_configmaps(job['k8s_namespace'], str(job['job_id']), delay_seconds=0)
                                 callback_error = None
@@ -533,13 +601,15 @@ def sync_job_status():
                                     rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
                                     if isinstance(rf, dict):
                                         callback_error = rf.get("error_message")
-                                _send_stepfunctions_callback(
+                                callback_state = _send_stepfunctions_callback(
                                     job,
                                     new_status,
                                     result_location=result_location,
                                     result_files=result_files,
                                     error_message=callback_error,
                                 )
+                                if callback_state == "stale_token":
+                                    _clear_task_token(update_cur, job["job_id"])
                             else:
                                 update_cur.execute(
                                     "UPDATE jobs SET status = %s WHERE job_id = %s",
@@ -585,24 +655,35 @@ def sync_job_status():
                                    WHERE job_id = %s""",
                                 (new_status, result_location, result_files, job['job_id'])
                             )
+                            refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
                             callback_error = None
                             if new_status == "FAILED":
                                 rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
                                 if isinstance(rf, dict):
                                     callback_error = rf.get("error_message")
-                            _send_stepfunctions_callback(
+                            callback_state = _send_stepfunctions_callback(
                                 job,
                                 new_status,
                                 result_location=result_location,
                                 result_files=result_files,
                                 error_message=callback_error,
                             )
-                            logger.warning(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
+                            if callback_state == "stale_token":
+                                _clear_task_token(update_cur, job["job_id"])
+                            logger.debug(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
                             _LAST_PROGRESS_SENT.pop(job_id_str, None)
                         else:
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
                             logger.error(f"Failed to sync job {job['job_id']}: {e}")
                     except Exception as e:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
                         logger.error(f"Failed to sync job {job['job_id']}: {e}")
         except Exception as e:
             logger.error(f"Reconciler error: {e}")

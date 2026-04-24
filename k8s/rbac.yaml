@@ -23,7 +23,7 @@ metadata:
   name: sumo-k8-controller-cluster
 rules:
 - apiGroups: [""]
-  resources: ["namespaces"]
+  resources: ["namespaces", "serviceaccounts"]
   verbs: ["get", "list", "create", "update", "patch"]
 - apiGroups: [""]
   resources: ["nodes"]

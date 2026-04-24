@@ -28,7 +28,8 @@ CREATE TABLE jobs (
   cpu_request INT CHECK (cpu_request > 0 AND cpu_request <= 32),
   memory_gi INT CHECK (memory_gi > 0 AND memory_gi <= 128),
   result_location TEXT,
-  result_files JSONB
+  result_files JSONB,
+  estimated_cost_usd NUMERIC(14, 6)
 );
 
 CREATE INDEX idx_jobs_tenant_status ON jobs(tenant_id, status);

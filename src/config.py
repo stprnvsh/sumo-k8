@@ -71,3 +71,14 @@ SIMULATION_NODE_SELECTOR_KEY = os.getenv("SIMULATION_NODE_SELECTOR_KEY", "node-t
 SIMULATION_NODE_SELECTOR_VALUES = [
     v.strip() for v in os.getenv("SIMULATION_NODE_SELECTOR_VALUES", "simulation").split(",") if v.strip()
 ]
+SIMULATION_PREFERRED_ZONES = [
+    v.strip() for v in os.getenv("SIMULATION_PREFERRED_ZONES", "").split(",") if v.strip()
+]
+
+# Estimated compute cost: (cpu * rate + memory_gi * rate) * wall_clock_hours.
+# If JOB_COST_CPU_USD_PER_HOUR and JOB_COST_MEMORY_GIB_USD_PER_HOUR are both 0, and
+# JOB_COST_AWS_INSTANCE_TYPE is set (e.g. m5.2xlarge), rates come from AWS Price List API
+# (Linux On-Demand for AWS_REGION). Requires IAM pricing:GetProducts.
+JOB_COST_CPU_USD_PER_HOUR = float(os.getenv("JOB_COST_CPU_USD_PER_HOUR", "0"))
+JOB_COST_MEMORY_GIB_USD_PER_HOUR = float(os.getenv("JOB_COST_MEMORY_GIB_USD_PER_HOUR", "0"))
+JOB_COST_AWS_INSTANCE_TYPE = os.getenv("JOB_COST_AWS_INSTANCE_TYPE", "").strip()

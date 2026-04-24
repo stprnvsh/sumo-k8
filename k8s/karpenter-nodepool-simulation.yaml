@@ -1,4 +1,4 @@
-apiVersion: karpenter.sh/v1beta1
+apiVersion: karpenter.sh/v1
 kind: NodePool
 metadata:
   name: simulation-nodes
@@ -7,7 +7,6 @@ spec:
     # Keep the existing behavior: scale back down when empty.
     consolidationPolicy: WhenEmpty
     consolidateAfter: 60s
-    expireAfter: 12h
     budgets:
     - nodes: 10%
   limits:
@@ -19,7 +18,10 @@ spec:
         node-type: simulation
         workload-type: simulation
     spec:
+      expireAfter: 12h
       nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
         name: simulation-nodeclass
       requirements:
       - key: kubernetes.io/arch
@@ -28,6 +30,9 @@ spec:
       - key: kubernetes.io/os
         operator: In
         values: ["linux"]
+      - key: topology.kubernetes.io/zone
+        operator: In
+        values: ["eu-central-2c", "eu-central-2a", "eu-central-2b"]
       - key: karpenter.sh/capacity-type
         operator: In
         values: ["on-demand"]
