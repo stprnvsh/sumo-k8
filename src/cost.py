@@ -8,7 +8,7 @@ import logging
 from .cost_aws import get_job_cost_rates
 
 logger = logging.getLogger(__name__)
-_MISSING_COST_COLUMN_LOGGED = False
+_HAS_COST_COLUMN: bool | None = None
 
 
 def _normalize_dt(dt: Any) -> Optional[datetime]:
@@ -48,8 +48,25 @@ def estimated_cost_usd(
     return round(total, 6)
 
 
+def _has_cost_column(cur) -> bool:
+    global _HAS_COST_COLUMN
+    if _HAS_COST_COLUMN is not None:
+        return _HAS_COST_COLUMN
+    cur.execute(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'jobs'
+          AND column_name = 'estimated_cost_usd'
+        """
+    )
+    _HAS_COST_COLUMN = cur.fetchone() is not None
+    return _HAS_COST_COLUMN
+
+
 def refresh_job_estimated_cost(cur, job_id) -> None:
-    global _MISSING_COST_COLUMN_LOGGED
+    if not _has_cost_column(cur):
+        return
     cur.execute(
         """SELECT cpu_request, memory_gi, started_at, finished_at
            FROM jobs WHERE job_id = %s""",
@@ -64,17 +81,7 @@ def refresh_job_estimated_cost(cur, job_id) -> None:
         row["started_at"],
         row["finished_at"],
     )
-    try:
-        cur.execute(
-            "UPDATE jobs SET estimated_cost_usd = %s WHERE job_id = %s",
-            (cost, job_id),
-        )
-    except Exception as exc:
-        msg = str(exc).lower()
-        pgcode = getattr(exc, "pgcode", None)
-        if pgcode == "42703" or "estimated_cost_usd" in msg:
-            if not _MISSING_COST_COLUMN_LOGGED:
-                logger.warning("Skipping estimated cost update: jobs.estimated_cost_usd column missing")
-                _MISSING_COST_COLUMN_LOGGED = True
-            return
-        raise
+    cur.execute(
+        "UPDATE jobs SET estimated_cost_usd = %s WHERE job_id = %s",
+        (cost, job_id),
+    )

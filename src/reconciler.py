@@ -14,6 +14,7 @@ from .database import get_db
 from .k8s_client import k8s_available, k8s_batch, k8s_core
 from .scaling import cleanup_configmaps
 from .jobs import dispatch_queued_jobs
+from .reservations import expire_stale_reservations, sync_reservation_statuses
 from .storage import detect_storage_type, get_result_storage_info, s3_prefix_has_files
 from .cost import refresh_job_estimated_cost
 from .config import (
@@ -24,6 +25,8 @@ from .config import (
     LEGACY_CONFIGMAP_SWEEPER_NAME_CONTAINS,
     LEGACY_CONFIGMAP_SWEEPER_MIN_AGE_HOURS,
     LEGACY_CONFIGMAP_SWEEPER_MAX_DELETES_PER_RUN,
+    STALE_ACTIVE_JOB_HOURS,
+    GHOST_IDLE_GRACE_SECONDS,
 )
 from psycopg2.extras import Json
 
@@ -144,6 +147,282 @@ def _job_pod_phase_running(namespace: str, k8s_job_name: str) -> bool:
         return False
     except Exception:
         return False
+
+
+def _classify_k8s_workload(namespace: str, k8s_job_name: str) -> str:
+    """
+    Classify whether a DB-active job has real cluster work behind it.
+    Returns: live | terminal | idle | missing | unknown
+    """
+    if not k8s_available:
+        return "unknown"
+    try:
+        k8s_job = k8s_batch.read_namespaced_job(k8s_job_name, namespace)
+    except client.exceptions.ApiException as e:
+        if e.status == 404:
+            return "missing"
+        logger.debug("Could not read K8s job %s/%s: %s", namespace, k8s_job_name, e)
+        return "unknown"
+    except Exception as e:
+        logger.debug("Could not read K8s job %s/%s: %s", namespace, k8s_job_name, e)
+        return "unknown"
+
+    status = k8s_job.status
+    if status:
+        if status.succeeded or status.failed:
+            return "terminal"
+        if status.active:
+            return "live"
+    if status and status.conditions:
+        for cond in status.conditions:
+            if cond.type in ("Complete", "Failed") and cond.status == "True":
+                return "terminal"
+    if _job_pod_phase_running(namespace, k8s_job_name):
+        return "live"
+    return "idle"
+
+
+def _eligible_for_s3_repair(workload: str, has_files: bool) -> bool:
+    """Whether a DB-active job may be finalized to SUCCEEDED purely from S3 results.
+
+    Only when results exist AND the pod is gone/terminal -- never while it is still
+    LIVE. A running pod mid-upload has only its first (smallest) files in S3 (summary
+    + inputs upload before the large routes/fcd), so s3_prefix_has_files() goes True
+    long before the upload completes; finalizing then fires SendTaskSuccess early and
+    the downstream per-seed sync copies a PARTIAL result set (the dropped-seed bug).
+    A live job must be finalized by the active-jobs loop on real pod-exit, where the
+    run script's `set -e` + sequential upload_results.py guarantees completeness.
+    'unknown' (K8s API read failed) is excluded: we cannot confirm the pod is gone.
+    """
+    return has_files and workload in ("missing", "idle", "terminal")
+
+
+def _terminal_status_from_k8s_job(k8s_job) -> str:
+    if k8s_job.status and k8s_job.status.succeeded:
+        return "SUCCEEDED"
+    if k8s_job.status and k8s_job.status.failed:
+        return "FAILED"
+    if k8s_job.status and k8s_job.status.conditions:
+        for cond in k8s_job.status.conditions:
+            if cond.type == "Complete" and cond.status == "True":
+                return "SUCCEEDED"
+            if cond.type == "Failed" and cond.status == "True":
+                return "FAILED"
+    return "FAILED"
+
+
+def _job_active_age_seconds(job) -> float:
+    ts = job.get("started_at") or job.get("submitted_at")
+    if not ts:
+        return 0.0
+    if getattr(ts, "tzinfo", None):
+        ts = ts.replace(tzinfo=None)
+    return max(0.0, (datetime.now() - ts).total_seconds())
+
+
+def _terminal_from_s3(storage_type: str, job) -> tuple[str, str | None, object | None]:
+    """If results exist in object storage, treat job as SUCCEEDED."""
+    if storage_type != "s3":
+        return "FAILED", None, None
+    storage_info = get_result_storage_info(str(job["job_id"]), job["k8s_namespace"], storage_type)
+    prefix = storage_info.get("prefix", "")
+    if prefix and s3_prefix_has_files(prefix):
+        return (
+            "SUCCEEDED",
+            prefix,
+            Json({"storage_type": "s3", "uploaded": True, "prefix": prefix}),
+        )
+    return "FAILED", None, None
+
+
+def _build_terminal_result(
+    job,
+    storage_type: str,
+    new_status: str,
+    error_message: str | None = None,
+):
+    job_id_str = str(job["job_id"])
+    if new_status == "SUCCEEDED":
+        storage_info = get_result_storage_info(job_id_str, job["k8s_namespace"], storage_type)
+        if storage_type == "s3":
+            prefix = storage_info.get("prefix", "")
+            return prefix, Json({"storage_type": "s3", "uploaded": True, "prefix": prefix})
+        return storage_info.get("path", ""), None
+    failure = _extract_failure_info(job["k8s_namespace"], job["k8s_job_name"])
+    return None, Json({
+        "storage_type": storage_type,
+        "uploaded": False,
+        "error_message": error_message or failure.get("pod_reason", "Job failed"),
+        "failure": failure,
+    })
+
+
+def _finalize_job_terminal(cur, conn, job, new_status: str, storage_type: str, error_message: str | None = None):
+    """Persist terminal status, release slot, commit, then Step Functions callback."""
+    job_id_str = str(job["job_id"])
+    result_location, result_files = _build_terminal_result(
+        job, storage_type, new_status, error_message=error_message
+    )
+
+    cur.execute(
+        """UPDATE jobs
+           SET status = %s,
+               occupies_slot = FALSE,
+               finished_at = NOW(),
+               started_at = COALESCE(started_at, submitted_at),
+               result_location = COALESCE(%s, result_location),
+               result_files = COALESCE(%s, result_files)
+           WHERE job_id = %s""",
+        (new_status, result_location, result_files, job["job_id"]),
+    )
+    if cur.rowcount < 1:
+        logger.error("Finalize job %s: UPDATE matched no rows", job_id_str)
+        return
+    conn.commit()
+    try:
+        refresh_job_estimated_cost(cur, job["job_id"])
+        conn.commit()
+    except Exception as exc:
+        logger.debug("Cost refresh after finalize skipped for %s: %s", job_id_str, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    cleanup_configmaps(job["k8s_namespace"], job_id_str, delay_seconds=0)
+
+    callback_error = None
+    if new_status == "FAILED":
+        rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
+        if isinstance(rf, dict):
+            callback_error = rf.get("error_message")
+    callback_state = _send_stepfunctions_callback(
+        job,
+        new_status,
+        result_location=result_location,
+        result_files=result_files,
+        error_message=callback_error,
+    )
+    if callback_state == "stale_token":
+        with get_db() as conn2:
+            cur2 = conn2.cursor()
+            _clear_task_token(cur2, job["job_id"])
+    _LAST_PROGRESS_SENT.pop(job_id_str, None)
+    logger.info("Finalized job %s as %s", job_id_str, new_status)
+
+
+def _reconcile_non_live_active_job(cur, conn, job, storage_type: str, workload: str, reason: str):
+    """Terminalize a PENDING/RUNNING row that has no live cluster work."""
+    if workload == "unknown":
+        return False
+    if workload == "live":
+        return False
+
+    if workload == "terminal":
+        k8s_job = k8s_batch.read_namespaced_job(job["k8s_job_name"], job["k8s_namespace"])
+        new_status = _terminal_status_from_k8s_job(k8s_job)
+        _finalize_job_terminal(cur, conn, job, new_status, storage_type)
+        logger.warning("Synced non-live job %s from K8s terminal (%s)", job["job_id"], reason)
+        return True
+
+    new_status, _, _ = _terminal_from_s3(storage_type, job)
+    error_message = None
+    if new_status == "FAILED":
+        error_message = f"{reason} (k8s_state={workload})"
+    _finalize_job_terminal(cur, conn, job, new_status, storage_type, error_message=error_message)
+    logger.warning(
+        "Reconciled non-live job %s -> %s (%s, k8s_state=%s)",
+        job["job_id"],
+        new_status,
+        reason,
+        workload,
+    )
+    return True
+
+
+def reconcile_ghost_active_jobs():
+    """
+    Every cycle: fix PENDING/RUNNING rows with no live K8s workload so they do not block the queue.
+    """
+    if not k8s_available:
+        return
+
+    storage_type = detect_storage_type()
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data,
+                          cpu_request, memory_gi, submitted_at, started_at
+                   FROM jobs
+                   WHERE status IN ('PENDING', 'RUNNING')
+                   ORDER BY submitted_at ASC
+                   LIMIT 100"""
+            )
+            for job in cur.fetchall():
+                workload = _classify_k8s_workload(job["k8s_namespace"], job["k8s_job_name"])
+                if workload in ("live", "unknown"):
+                    continue
+                if workload == "idle":
+                    s3_status, _, _ = _terminal_from_s3(storage_type, job)
+                    if s3_status != "SUCCEEDED" and _job_active_age_seconds(job) < GHOST_IDLE_GRACE_SECONDS:
+                        continue
+                try:
+                    with get_db() as job_conn:
+                        job_cur = job_conn.cursor()
+                        _reconcile_non_live_active_job(
+                            job_cur,
+                            job_conn,
+                            job,
+                            storage_type,
+                            workload,
+                            "ghost_reconcile",
+                        )
+                except Exception as e:
+                    logger.error("Ghost reconcile failed for %s: %s", job["job_id"], e)
+    except Exception as e:
+        logger.error("Ghost active job sweep error: %s", e)
+
+
+def expire_stale_active_jobs():
+    """
+    Fail PENDING/RUNNING jobs that have held a concurrency slot for STALE_ACTIVE_JOB_HOURS
+    without a live Kubernetes workload (no Job, idle Job, or completed Job not synced).
+    """
+    if not k8s_available or STALE_ACTIVE_JOB_HOURS <= 0:
+        return
+
+    storage_type = detect_storage_type()
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data,
+                          cpu_request, memory_gi, submitted_at, started_at
+                   FROM jobs
+                   WHERE status IN ('PENDING', 'RUNNING')
+                     AND COALESCE(started_at, submitted_at)
+                         < NOW() - (%s * INTERVAL '1 hour')
+                   ORDER BY COALESCE(started_at, submitted_at) ASC
+                   LIMIT 50""",
+                (STALE_ACTIVE_JOB_HOURS,),
+            )
+            stale_jobs = cur.fetchall()
+
+            for job in stale_jobs:
+                workload = _classify_k8s_workload(job["k8s_namespace"], job["k8s_job_name"])
+                reason = (
+                    f"Stale {job['status']} job cleared after {STALE_ACTIVE_JOB_HOURS}h "
+                    "with no live Kubernetes workload"
+                )
+                try:
+                    _reconcile_non_live_active_job(
+                        cur, conn, job, storage_type, workload, reason
+                    )
+                except Exception as e:
+                    conn.rollback()
+                    logger.error("Failed expiring stale job %s: %s", job["job_id"], e)
+    except Exception as e:
+        logger.error("Stale active job sweep error: %s", e)
 
 
 def _to_int_or_none(value):
@@ -302,7 +581,14 @@ def sync_job_status():
             continue
             
         try:
+            reconcile_ghost_active_jobs()
+            expire_stale_active_jobs()
             dispatch_queued_jobs()
+            try:
+                expire_stale_reservations()
+                sync_reservation_statuses()
+            except Exception as res_exc:
+                logger.warning("Reservation maintenance skipped: %s", res_exc)
             with get_db() as conn:
                 cur = conn.cursor()
                 storage_type = detect_storage_type()
@@ -440,13 +726,13 @@ def sync_job_status():
                     except Exception as e:
                         logger.debug(f"Could not backfill result_files for {job['job_id']}: {e}")
 
-                # Repair jobs incorrectly marked FAILED when K8s Job was already GC'd
-                # but direct S3 upload completed successfully.
+                # Repair terminal status from S3 when K8s is gone or DB drifted.
                 if storage_type == "s3":
                     cur.execute(
-                        """SELECT job_id, k8s_namespace, cpu_request, memory_gi
+                        """SELECT job_id, k8s_namespace, k8s_job_name, status, tenant_id,
+                                  scenario_data, cpu_request, memory_gi
                            FROM jobs
-                           WHERE status = 'FAILED'
+                           WHERE status IN ('FAILED', 'RUNNING', 'PENDING')
                            AND result_location IS NULL
                            ORDER BY submitted_at DESC
                            LIMIT 50"""
@@ -456,12 +742,21 @@ def sync_job_status():
                         try:
                             storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
                             prefix = storage_info.get("prefix", "")
-                            if not prefix or not s3_prefix_has_files(prefix):
+                            has_files = bool(prefix) and s3_prefix_has_files(prefix)
+                            # Never finalize a job whose pod is still LIVE (e.g. mid-upload):
+                            # S3 holds only its first/smallest files then (summary + inputs),
+                            # so repairing fires SendTaskSuccess early and the downstream
+                            # per-seed sync copies a PARTIAL result set -> ConvertRoutes 404
+                            # (the dropped-seed bug). Let the active-jobs loop finalize live
+                            # jobs on real pod-exit, when the upload is provably complete.
+                            workload = _classify_k8s_workload(job["k8s_namespace"], job["k8s_job_name"])
+                            if not _eligible_for_s3_repair(workload, has_files):
                                 continue
                             update_cur = conn.cursor()
                             update_cur.execute(
                                 """UPDATE jobs
                                    SET status = 'SUCCEEDED',
+                                       occupies_slot = FALSE,
                                        result_location = %s,
                                        result_files = %s,
                                        finished_at = COALESCE(finished_at, NOW()),
@@ -479,14 +774,28 @@ def sync_job_status():
                             )
                             refresh_job_estimated_cost(update_cur, job["job_id"])
                             conn.commit()
-                            logger.info(f"Repaired FAILED->SUCCEEDED for job {job['job_id']} based on S3 results")
+                            _send_stepfunctions_callback(
+                                job,
+                                "SUCCEEDED",
+                                result_location=prefix,
+                                result_files=Json({
+                                    "storage_type": "s3",
+                                    "uploaded": True,
+                                    "prefix": prefix,
+                                }),
+                            )
+                            logger.info(
+                                "Repaired %s->SUCCEEDED for job %s based on S3 results",
+                                job["status"],
+                                job["job_id"],
+                            )
                         except Exception as e:
                             logger.debug(f"Could not repair failed job {job['job_id']}: {e}")
                 
                 # Then process active jobs
                 cur.execute(
                     """SELECT job_id, k8s_job_name, k8s_namespace, status, tenant_id, scenario_data,
-                              cpu_request, memory_gi
+                              cpu_request, memory_gi, occupies_slot
                        FROM jobs
                        WHERE status IN ('PENDING', 'RUNNING')
                        ORDER BY submitted_at DESC
@@ -505,8 +814,13 @@ def sync_job_status():
                                 scenario = {}
                         k8s_job = k8s_batch.read_namespaced_job(job['k8s_job_name'], job['k8s_namespace'])
                         new_status = job['status']
-                        
-                        if k8s_job.status.conditions:
+                        workload = _classify_k8s_workload(
+                            job["k8s_namespace"], job["k8s_job_name"]
+                        )
+
+                        if workload == "terminal":
+                            new_status = _terminal_status_from_k8s_job(k8s_job)
+                        elif k8s_job.status.conditions:
                             for cond in k8s_job.status.conditions:
                                 if cond.type == "Failed" and cond.status == "True":
                                     new_status = "FAILED"
@@ -518,11 +832,10 @@ def sync_job_status():
                         running_pod = _job_pod_phase_running(
                             job["k8s_namespace"], job["k8s_job_name"]
                         )
-                        # Job.status.active counts uncompleted pods including Pending; use pod phase Running.
-                        if new_status == "PENDING" and running_pod:
+                        if new_status in ("PENDING", "RUNNING") and workload == "live":
                             new_status = "RUNNING"
-                        elif new_status == "RUNNING" and not running_pod:
-                            new_status = "PENDING"
+                        elif new_status == "PENDING" and running_pod:
+                            new_status = "RUNNING"
 
                         if (new_status == "RUNNING" or (job["status"] == "RUNNING" and running_pod)):
                             start_sec = _to_int_or_none(scenario.get("progress_start_sec"))
@@ -542,137 +855,61 @@ def sync_job_status():
                                         if _send_progress_webhook(job, 0, float(start_sec)):
                                             _LAST_PROGRESS_SENT[job_id_str] = 0
 
-                        if new_status != job['status']:
+                        if new_status != job['status'] or (
+                            new_status == "RUNNING" and not job.get("occupies_slot")
+                        ):
                             update_cur = conn.cursor()
                             if new_status == "RUNNING":
                                 update_cur.execute(
-                                    "UPDATE jobs SET status = %s, started_at = NOW() WHERE job_id = %s",
+                                    """UPDATE jobs SET status = %s, occupies_slot = TRUE,
+                                       started_at = COALESCE(started_at, NOW()) WHERE job_id = %s""",
                                     (new_status, job['job_id'])
                                 )
-                            elif new_status == "PENDING" and job["status"] == "RUNNING":
-                                update_cur.execute(
-                                    "UPDATE jobs SET status = %s, started_at = NULL WHERE job_id = %s",
-                                    (new_status, job['job_id'])
-                                )
+                                conn.commit()
                             elif new_status in ("SUCCEEDED", "FAILED"):
                                 _send_terminal_progress_if_needed(job, scenario, new_status, job_id_str)
-                                # Store result location info
-                                storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
-                                
-                                if new_status == "SUCCEEDED":
-                                    # Direct S3 upload: keep metadata lightweight in reconciler.
-                                    if storage_type == "s3":
-                                        prefix = storage_info.get("prefix", "")
-                                        result_location = prefix
-                                        result_files = Json({
-                                            "storage_type": "s3",
-                                            "uploaded": True,
-                                            "prefix": prefix,
-                                        })
-                                        logger.info(f"Job {job['job_id']} completed; S3 prefix set")
-                                    else:
-                                        result_location = storage_info.get("path", "")
-                                        result_files = None
-                                else:
-                                    result_location = None
-                                    failure = _extract_failure_info(job['k8s_namespace'], job['k8s_job_name'])
-                                    result_files = Json({
-                                        "storage_type": storage_type,
-                                        "uploaded": False,
-                                        "error_message": failure.get("pod_reason", "Job failed"),
-                                        "failure": failure,
-                                    })
-                                
-                                update_cur.execute(
-                                    """UPDATE jobs 
-                                       SET status = %s, 
-                                           finished_at = NOW(),
-                                           started_at = COALESCE(started_at, NOW()),
-                                           result_location = %s,
-                                           result_files = %s
-                                       WHERE job_id = %s""",
-                                    (new_status, result_location, result_files, job['job_id'])
+                                failure = _extract_failure_info(
+                                    job['k8s_namespace'], job['k8s_job_name']
+                                ) if new_status == "FAILED" else None
+                                err = (failure or {}).get("pod_reason", "Job failed") if failure else None
+                                _finalize_job_terminal(
+                                    update_cur, conn, job, new_status, storage_type, error_message=err
                                 )
-                                refresh_job_estimated_cost(update_cur, job["job_id"])
-                                # Schedule ConfigMap cleanup
-                                cleanup_configmaps(job['k8s_namespace'], str(job['job_id']), delay_seconds=0)
-                                callback_error = None
-                                if new_status == "FAILED":
-                                    rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
-                                    if isinstance(rf, dict):
-                                        callback_error = rf.get("error_message")
-                                callback_state = _send_stepfunctions_callback(
-                                    job,
-                                    new_status,
-                                    result_location=result_location,
-                                    result_files=result_files,
-                                    error_message=callback_error,
-                                )
-                                if callback_state == "stale_token":
-                                    _clear_task_token(update_cur, job["job_id"])
                             else:
                                 update_cur.execute(
                                     "UPDATE jobs SET status = %s WHERE job_id = %s",
                                     (new_status, job['job_id'])
                                 )
-                            conn.commit()
-                            logger.info(f"Updated job {job['job_id']} status: {job['status']} -> {new_status}")
-                            if new_status in ("SUCCEEDED", "FAILED"):
-                                _LAST_PROGRESS_SENT.pop(job_id_str, None)
+                                conn.commit()
+                            logger.info(
+                                "Updated job %s status: %s -> %s",
+                                job['job_id'],
+                                job['status'],
+                                new_status,
+                            )
                     except client.exceptions.ApiException as e:
                         if e.status == 404:
-                            # If the K8s Job has already been deleted but results exist in S3,
-                            # preserve correct terminal state as SUCCEEDED.
-                            new_status = "FAILED"
-                            result_location = None
-                            failure = _extract_failure_info(job['k8s_namespace'], job['k8s_job_name'])
-                            result_files = Json({
-                                "storage_type": storage_type,
-                                "uploaded": False,
-                                "error_message": failure.get("pod_reason", "K8s job not found after submission"),
-                                "failure": failure,
-                            })
-                            if storage_type == "s3":
-                                storage_info = get_result_storage_info(str(job['job_id']), job['k8s_namespace'], storage_type)
-                                prefix = storage_info.get("prefix", "")
-                                if prefix and s3_prefix_has_files(prefix):
-                                    new_status = "SUCCEEDED"
-                                    result_location = prefix
-                                    result_files = Json({
-                                        "storage_type": "s3",
-                                        "uploaded": True,
-                                        "prefix": prefix,
-                                    })
-
                             update_cur = conn.cursor()
-                            update_cur.execute(
-                                """UPDATE jobs
-                                   SET status = %s,
-                                       finished_at = NOW(),
-                                       started_at = COALESCE(started_at, NOW()),
-                                       result_location = COALESCE(%s, result_location),
-                                       result_files = COALESCE(%s, result_files)
-                                   WHERE job_id = %s""",
-                                (new_status, result_location, result_files, job['job_id'])
-                            )
-                            refresh_job_estimated_cost(update_cur, job["job_id"])
-                            conn.commit()
-                            callback_error = None
+                            new_status, _, _ = _terminal_from_s3(storage_type, job)
+                            err = "K8s job not found after submission"
                             if new_status == "FAILED":
-                                rf = result_files.adapted if hasattr(result_files, "adapted") else result_files
-                                if isinstance(rf, dict):
-                                    callback_error = rf.get("error_message")
-                            callback_state = _send_stepfunctions_callback(
-                                job,
+                                _finalize_job_terminal(
+                                    update_cur, conn, job, "FAILED", storage_type, error_message=err
+                                )
+                            else:
+                                _reconcile_non_live_active_job(
+                                    update_cur,
+                                    conn,
+                                    job,
+                                    storage_type,
+                                    "missing",
+                                    "k8s_job_not_found",
+                                )
+                            logger.debug(
+                                "Job %s not found in K8s, reconciled as %s",
+                                job['job_id'],
                                 new_status,
-                                result_location=result_location,
-                                result_files=result_files,
-                                error_message=callback_error,
                             )
-                            if callback_state == "stale_token":
-                                _clear_task_token(update_cur, job["job_id"])
-                            logger.debug(f"Job {job['job_id']} not found in K8s, marked as {new_status}")
-                            _LAST_PROGRESS_SENT.pop(job_id_str, None)
                         else:
                             try:
                                 conn.rollback()

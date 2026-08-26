@@ -46,6 +46,12 @@ spec:
               name: sumo-k8-secrets
               key: AWS_SECRET_ACCESS_KEY
               optional: true
+        - name: WEBHOOK_SHARED_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sumo-k8-secrets
+              key: WEBHOOK_SHARED_TOKEN
+              optional: true
         envFrom:
         - configMapRef:
             name: sumo-k8-config

@@ -1,5 +1,20 @@
 # Project Status
 
+## 2026-05-19
+- Self-healing job lifecycle (reconciler + DB):
+  - `reconcile_ghost_active_jobs()` every cycle: terminalize `missing`/`idle`/`terminal` K8s with no live pod (S3 repair, idle grace `GHOST_IDLE_GRACE_SECONDS`).
+  - `expire_stale_active_jobs()` after 6h for stragglers.
+  - Step Functions callbacks only **after** DB commit.
+  - No `RUNNING`→`PENDING` downgrade on pod exit (ghost sweep handles terminal).
+  - `occupies_slot` column: dispatch limits count real slots only (`migrations/002_occupies_slot.sql`, `ensure_db_schema()` on startup).
+  - S3 repair includes stuck `RUNNING`/`PENDING` rows.
+  - `deploy/build-push-controller-amd64.sh` for EKS-safe image builds.
+
+## 2026-04-17
+- Fixed reconciler DB error loop when `jobs.estimated_cost_usd` is missing:
+  - Updated `src/cost.py` `refresh_job_estimated_cost(...)` to safely skip cost-column updates when Postgres returns undefined column (`42703`) instead of crashing reconcile paths.
+  - This keeps status/progress reconciliation running even on older DB schemas without the cost column.
+
 ## 2026-04-16
 - Fixed tenant namespace startup reliability for simulation jobs:
   - Added `serviceaccounts` permissions to controller RBAC manifests (`k8s/serviceaccount.yaml`, `k8s/rbac.yaml`) so controller can create `simulation-runner` in org namespaces.

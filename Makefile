@@ -31,7 +31,7 @@ clean:
 	@echo "✓ Cleaned Python cache files"
 
 docker-build:
-	@docker build -t sumo-k8-controller:latest .
+	@docker build --platform linux/amd64 -t sumo-k8-controller:latest .
 
 docker-run:
 	@docker-compose up

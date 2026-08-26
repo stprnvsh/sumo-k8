@@ -49,6 +49,30 @@ def get_db():
         if conn:
             db_pool.putconn(conn)
 
+def ensure_db_schema():
+    """Apply lightweight schema patches (safe to run on every startup)."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS occupies_slot BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        cur.execute(
+            """
+            UPDATE jobs SET occupies_slot = TRUE
+            WHERE status IN ('PENDING', 'RUNNING') AND occupies_slot IS NOT TRUE
+            """
+        )
+        cur.execute(
+            """
+            UPDATE jobs SET occupies_slot = FALSE
+            WHERE status NOT IN ('PENDING', 'RUNNING') AND occupies_slot IS NOT FALSE
+            """
+        )
+        cur.execute(
+            "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(14, 6)"
+        )
+
+
 def close_db_pool():
     """Close database connection pool"""
     global db_pool

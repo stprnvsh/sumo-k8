@@ -30,9 +30,12 @@ def ensure_tenant_namespace(tenant):
     try:
         existing_quota = k8s_core.read_namespaced_resource_quota(quota_name, ns_name)
         # Update if limits changed
+        hard = existing_quota.spec.hard or {}
+        want_pods = str(tenant.get("max_concurrent_jobs", 10))
         needs_update = (
-            existing_quota.spec.hard.get("requests.cpu") != str(tenant['max_cpu']) or
-            existing_quota.spec.hard.get("requests.memory") != f"{tenant['max_memory_gi']}Gi"
+            hard.get("requests.cpu") != str(tenant["max_cpu"])
+            or hard.get("requests.memory") != f"{tenant['max_memory_gi']}Gi"
+            or hard.get("pods") != want_pods
         )
         if needs_update:
             quota = client.V1ResourceQuota(

@@ -9,7 +9,7 @@ CREATE TABLE tenants (
   api_key TEXT UNIQUE NOT NULL,
   max_cpu INT DEFAULT 10 CHECK (max_cpu > 0 AND max_cpu <= 1000),
   max_memory_gi INT DEFAULT 20 CHECK (max_memory_gi > 0 AND max_memory_gi <= 5000),
-  max_concurrent_jobs INT DEFAULT 2 CHECK (max_concurrent_jobs > 0 AND max_concurrent_jobs <= 200),
+  max_concurrent_jobs INT DEFAULT 20 CHECK (max_concurrent_jobs > 0 AND max_concurrent_jobs <= 200),
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -21,6 +21,7 @@ CREATE TABLE jobs (
   k8s_job_name TEXT NOT NULL,
   k8s_namespace TEXT NOT NULL,
   status TEXT DEFAULT 'QUEUED' CHECK (status IN ('QUEUED', 'PENDING', 'RUNNING', 'SUCCEEDED', 'FAILED')),
+  occupies_slot BOOLEAN NOT NULL DEFAULT FALSE,
   submitted_at TIMESTAMPTZ DEFAULT NOW(),
   started_at TIMESTAMPTZ,
   finished_at TIMESTAMPTZ,
@@ -33,12 +34,13 @@ CREATE TABLE jobs (
 );
 
 CREATE INDEX idx_jobs_tenant_status ON jobs(tenant_id, status);
+CREATE INDEX idx_jobs_tenant_occupies_slot ON jobs(tenant_id, occupies_slot) WHERE occupies_slot = TRUE;
 CREATE INDEX idx_jobs_submitted_at ON jobs(submitted_at DESC);
 CREATE INDEX idx_jobs_k8s_job_name ON jobs(k8s_job_name, k8s_namespace);
 
 -- Sample tenants for testing
 INSERT INTO tenants (tenant_id, namespace, api_key, max_cpu, max_memory_gi, max_concurrent_jobs) VALUES
-  ('city-a', 'city-a', 'key-city-a-12345', 10, 20, 2),
-  ('city-b', 'city-b', 'key-city-b-67890', 5, 10, 1)
+  ('city-a', 'city-a', 'key-city-a-12345', 10, 20, 20),
+  ('city-b', 'city-b', 'key-city-b-67890', 5, 10, 10)
 ON CONFLICT (tenant_id) DO NOTHING;
 

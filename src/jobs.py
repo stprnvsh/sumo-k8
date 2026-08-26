@@ -28,6 +28,7 @@ from .config import (
 import os
 from .storage import detect_storage_type
 from psycopg2.extras import Json
+from . import org_audit
 import boto3
 
 logger = logging.getLogger(__name__)
@@ -271,7 +272,7 @@ def _dispatch_one_queued(tenant_id: str) -> bool:
             AND (
               SELECT COUNT(*) FROM jobs j2
               WHERE j2.tenant_id = j.tenant_id
-              AND j2.status IN ('PENDING', 'RUNNING')
+              AND j2.occupies_slot = TRUE
             ) < t.max_concurrent_jobs
             ORDER BY j.submitted_at ASC
             LIMIT 1
@@ -312,7 +313,8 @@ def _dispatch_one_queued(tenant_id: str) -> bool:
             scenario=scenario,
         )
         cur.execute(
-            "UPDATE jobs SET status = 'PENDING' WHERE job_id = %s",
+            """UPDATE jobs SET status = 'PENDING', occupies_slot = TRUE
+               WHERE job_id = %s""",
             (job_id,),
         )
     return True
@@ -333,6 +335,8 @@ def create_k8s_job(
         raise HTTPException(status_code=503, detail="Kubernetes not available")
 
     k8s_name = f"sim-{job_id[:8]}"
+
+    scenario = scenario or {}
 
     if not queue_key and not s3_file_urls:
         raise HTTPException(status_code=400, detail="No input source for job")
@@ -398,8 +402,11 @@ job_id = os.getenv("JOB_ID", "")
 tenant_id = os.getenv("TENANT_ID", "")
 config_file = os.environ["CONFIG_FILE"]
 region = os.getenv("S3_REGION") or None
-group = os.getenv("CLOUDWATCH_SIM_LOG_GROUP", "").strip()
+group = os.getenv("ORG_AUDIT_LOG_GROUP", "").strip() or os.getenv("CLOUDWATCH_SIM_LOG_GROUP", "").strip()
 stream = f"{tenant_id}/{job_id}" if job_id else f"{tenant_id}/unknown"
+org_id_str = os.getenv("ORGANISATION_ID", "").strip()
+sim_audit_id = os.getenv("SIMULATION_ID_FOR_AUDIT", "").strip() or os.getenv("PROGRESS_SIMULATION_ID", "").strip() or os.getenv("SCENARIO_ID", "")
+exec_arn = os.getenv("EXECUTION_ARN", "").strip()
 progress_webhook_url = os.getenv("PROGRESS_WEBHOOK_URL", "").strip()
 progress_webhook_token = os.getenv("PROGRESS_WEBHOOK_TOKEN", "").strip()
 progress_simulation_id = os.getenv("PROGRESS_SIMULATION_ID", "").strip()
@@ -465,8 +472,16 @@ def _send_progress(step):
         pass
 
 def emit(event_type, message, step=None):
+    oid = int(org_id_str) if org_id_str.isdigit() else None
     payload = {
         "event": event_type,
+        "audit_key": f"simulation.{event_type}",
+        "source": "sumo-simulation-pod",
+        "component": "simulation_pod",
+        "log_type": "simulation",
+        "organisation_id": oid,
+        "simulation_id": sim_audit_id or None,
+        "execution_arn": exec_arn or None,
         "job_id": job_id,
         "tenant_id": tenant_id,
         "step": step,
@@ -498,6 +513,7 @@ proc = subprocess.Popen(
 )
 for raw in proc.stdout:
     line = raw.rstrip("\\n")
+    emit("raw_line", line)
     m = step_re.search(line)
     step_value = None
     if m:
@@ -513,6 +529,33 @@ code = proc.wait()
 if code != 0:
     emit("sumo_exit", f"sumo exited with code {code}")
     sys.exit(code)
+# Gate success on the configured outputs actually existing. Node starvation or an
+# early teardown can leave a seed with no routes/fcd even when sumo returns 0; fail
+# loudly here so the seed fails at the simulation step (SeedMap can then tolerate it)
+# instead of silently "succeeding" and 404-ing at the next pipeline step. Inlined so
+# it needs no extra file baked into the sim image. (Mirrors scripts/validate_outputs.py.)
+import xml.etree.ElementTree as _ET
+try:
+    _out = _ET.parse(config_file).getroot().find(".//output")
+    _missing = []
+    if _out is not None:
+        for _el in _out:
+            _t = _el.tag
+            if ("." in _t) or (not _t.endswith("-output")):
+                continue
+            _v = (_el.get("value") or "").strip()
+            if (not _v) or _v.lower() in ("true", "false"):
+                continue
+            _p = _v if os.path.isabs(_v) else os.path.join("/workspace", _v)
+            if (not os.path.isfile(_p)) or os.path.getsize(_p) == 0:
+                _missing.append(_v)
+    if _missing:
+        emit("sumo_exit", "output validation failed: missing/empty " + ", ".join(_missing))
+        sys.exit(1)
+except SystemExit:
+    raise
+except Exception as _e:
+    emit("raw_line", f"output validation skipped: {_e}")
 emit("sumo_complete", "sumo completed")
 PY
 python3 /scripts/upload_results.py
@@ -531,7 +574,6 @@ python3 /scripts/upload_results.py
         container_env.append(client.V1EnvVar(name="QUEUE_S3_KEY", value=queue_key))
     if CLOUDWATCH_SIM_LOG_GROUP:
         container_env.append(client.V1EnvVar(name="CLOUDWATCH_SIM_LOG_GROUP", value=CLOUDWATCH_SIM_LOG_GROUP))
-    scenario = scenario or {}
     progress_webhook_url = (scenario.get("progress_webhook_url") or "").strip()
     if progress_webhook_url:
         container_env.append(client.V1EnvVar(name="PROGRESS_WEBHOOK_URL", value=progress_webhook_url))
@@ -547,6 +589,18 @@ python3 /scripts/upload_results.py
     progress_webhook_token = (os.getenv("WEBHOOK_SHARED_TOKEN", "") or "").strip()
     if progress_webhook_token:
         container_env.append(client.V1EnvVar(name="PROGRESS_WEBHOOK_TOKEN", value=progress_webhook_token))
+
+    org_log = org_audit.org_audit_log_group_for_tenant(tenant["tenant_id"])
+    if org_log:
+        container_env.append(client.V1EnvVar(name="ORG_AUDIT_LOG_GROUP", value=org_log))
+    oid = org_audit.org_id_from_tenant_id(tenant["tenant_id"])
+    if oid is not None:
+        container_env.append(client.V1EnvVar(name="ORGANISATION_ID", value=str(oid)))
+    sim_audit = str(scenario.get("progress_simulation_id") or scenario_id)
+    container_env.append(client.V1EnvVar(name="SIMULATION_ID_FOR_AUDIT", value=sim_audit))
+    ear = str(scenario.get("execution_arn") or "").strip()
+    if ear:
+        container_env.append(client.V1EnvVar(name="EXECUTION_ARN", value=ear))
 
     # Add S3 environment variables for direct upload/input fetch
     storage_type = detect_storage_type()
@@ -612,6 +666,25 @@ python3 /scripts/upload_results.py
                 affinity.node_affinity = client.V1NodeAffinity()
             affinity.node_affinity.preferred_during_scheduling_ignored_during_execution = preferred
 
+    # Premium sims (8+ CPU): one heavy pod per node so two 16 CPU jobs don't share a node.
+    pod_labels = {"job-id": job_id, "tenant": tenant["tenant_id"]}
+    if cpu_request >= 8:
+        pod_labels["sumo-heavy"] = "true"
+        heavy_anti = client.V1PodAntiAffinity(
+            required_during_scheduling_ignored_during_execution=[
+                client.V1PodAffinityTerm(
+                    label_selector=client.V1LabelSelector(
+                        match_labels={"sumo-heavy": "true"}
+                    ),
+                    topology_key="kubernetes.io/hostname",
+                )
+            ],
+        )
+        if affinity is None:
+            affinity = client.V1Affinity(pod_anti_affinity=heavy_anti)
+        else:
+            affinity.pod_anti_affinity = heavy_anti
+
     # Create Kubernetes Job
     job_manifest = client.V1Job(
         metadata=client.V1ObjectMeta(
@@ -624,9 +697,7 @@ python3 /scripts/upload_results.py
             active_deadline_seconds=MAX_JOB_DURATION_HOURS * 3600,
             backoff_limit=0,
             template=client.V1PodTemplateSpec(
-                metadata=client.V1ObjectMeta(
-                    labels={"job-id": job_id, "tenant": tenant['tenant_id']}
-                ),
+                metadata=client.V1ObjectMeta(labels=pod_labels),
                 spec=client.V1PodSpec(
                     # Use service account with IRSA for S3 access
                     service_account_name="simulation-runner" if (storage_type == "s3" or queue_key or s3_file_urls) else None,
@@ -662,6 +733,16 @@ python3 /scripts/upload_results.py
     try:
         k8s_batch.create_namespaced_job(tenant['namespace'], job_manifest)
         logger.info(f"Created K8s Job {k8s_name} for tenant {tenant['tenant_id']}")
+        org_audit.put_org_audit_line(
+            tenant["tenant_id"],
+            {
+                "event": "k8s_job_created",
+                "simulation_id": str(scenario.get("progress_simulation_id") or scenario_id),
+                "execution_arn": scenario.get("execution_arn"),
+                "job_id": job_id,
+                "k8s_job_name": k8s_name,
+            },
+        )
     except Exception as e:
         logger.error(f"Failed to create K8s job: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to create job: {str(e)}")
@@ -680,8 +761,14 @@ async def submit_job(
     progress_start_sec: int | None = None,
     progress_end_sec: int | None = None,
     premium_sim: bool | None = None,
+    reservation_id: str | None = None,
+    execution_arn: str | None = None,
 ):
-    """Submit a SUMO simulation job"""
+    """Submit a SUMO simulation job.
+
+    Pass reservation_id to skip the QUEUED state entirely and start on a
+    pre-warmed node immediately (see POST /reservations).
+    """
     # Validate resource request
     validate_resource_request(cpu_request, memory_gi, tenant)
 
@@ -725,6 +812,118 @@ async def submit_job(
     k8s_name = f"sim-{job_id[:8]}"
     if zip_path:
         queue_key = _upload_queue_zip_to_s3(zip_path, tenant["tenant_id"], job_id)
+
+    scenario_json = Json(
+        {
+            "scenario_id": scenario_id,
+            "config_file": config_file,
+            "queue_s3_key": queue_key,
+            "s3_file_urls": s3_url_list if has_s3_urls else None,
+            "task_token": task_token,
+            "progress_webhook_url": (str(progress_webhook_url).strip() if progress_webhook_url else None),
+            "progress_simulation_id": int(progress_simulation_id) if progress_simulation_id is not None else None,
+            "progress_start_sec": int(progress_start_sec) if progress_start_sec is not None else None,
+            "progress_end_sec": int(progress_end_sec) if progress_end_sec is not None else None,
+            "premium_sim": bool(premium_sim) if premium_sim is not None else None,
+            "execution_arn": str(execution_arn).strip() if execution_arn else None,
+        }
+    )
+
+    # ------------------------------------------------------------------ #
+    # Fast path: reservation supplied — skip queue, dispatch immediately  #
+    # ------------------------------------------------------------------ #
+    if reservation_id:
+        from .reservations import claim_reservation
+
+        # Enforce concurrent job limit (reserved jobs bypass the queue but not the cap).
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT COUNT(*) AS cnt FROM jobs
+                   WHERE tenant_id = %s AND occupies_slot = TRUE""",
+                (tenant["tenant_id"],),
+            )
+            active = cur.fetchone()["cnt"]
+        if active >= tenant["max_concurrent_jobs"]:
+            if queue_key:
+                _delete_queue_zip_from_s3(queue_key)
+            if zip_path:
+                try:
+                    os.unlink(zip_path)
+                except Exception:
+                    pass
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Concurrent job limit ({tenant['max_concurrent_jobs']}) reached; "
+                    "wait for a running job to finish before claiming a reservation"
+                ),
+            )
+
+        # Claim the reservation — deletes placeholder pod, marks it CLAIMED.
+        # Do this before the DB insert so a crash here leaves a clear CLAIMED
+        # reservation rather than a PENDING job with no K8s counterpart.
+        try:
+            claim_reservation(reservation_id, tenant["tenant_id"], job_id)
+        except Exception:
+            if queue_key:
+                _delete_queue_zip_from_s3(queue_key)
+            if zip_path:
+                try:
+                    os.unlink(zip_path)
+                except Exception:
+                    pass
+            raise
+
+        try:
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO jobs
+                       (job_id, tenant_id, k8s_job_name, k8s_namespace, status, scenario_data, cpu_request, memory_gi)
+                       VALUES (%s, %s, %s, %s, 'PENDING', %s, %s, %s)""",
+                    (job_id, tenant["tenant_id"], k8s_name, tenant["namespace"],
+                     scenario_json, cpu_request, memory_gi),
+                )
+        except Exception:
+            if queue_key:
+                _delete_queue_zip_from_s3(queue_key)
+            raise
+        finally:
+            if zip_path:
+                try:
+                    os.unlink(zip_path)
+                except Exception:
+                    pass
+
+        ensure_tenant_namespace(tenant)
+
+        try:
+            create_k8s_job(
+                tenant, job_id, scenario_id, cpu_request, memory_gi, config_file,
+                queue_key=queue_key,
+                s3_file_urls=s3_url_list if has_s3_urls else None,
+                scenario=scenario_json.adapted if hasattr(scenario_json, "adapted") else {},
+            )
+        except Exception:
+            # K8s job creation failed after the reservation was consumed — mark FAILED
+            # immediately rather than leaving it stuck in PENDING forever.
+            with get_db() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    """UPDATE jobs SET status = 'FAILED', occupies_slot = FALSE
+                       WHERE job_id = %s""",
+                    (job_id,),
+                )
+            if queue_key:
+                _delete_queue_zip_from_s3(queue_key)
+            raise
+
+        return {"job_id": job_id, "status": "PENDING", "config_file": config_file}
+
+    # ------------------------------------------------------------------ #
+    # Normal path: enqueue and let the reconciler dispatch                #
+    # ------------------------------------------------------------------ #
     try:
         with get_db() as conn:
             cur = conn.cursor()
@@ -736,20 +935,7 @@ async def submit_job(
                     tenant["tenant_id"],
                     k8s_name,
                     tenant["namespace"],
-                    Json(
-                        {
-                            "scenario_id": scenario_id,
-                            "config_file": config_file,
-                            "queue_s3_key": queue_key,
-                            "s3_file_urls": s3_url_list if has_s3_urls else None,
-                            "task_token": task_token,
-                            "progress_webhook_url": (str(progress_webhook_url).strip() if progress_webhook_url else None),
-                            "progress_simulation_id": int(progress_simulation_id) if progress_simulation_id is not None else None,
-                            "progress_start_sec": int(progress_start_sec) if progress_start_sec is not None else None,
-                            "progress_end_sec": int(progress_end_sec) if progress_end_sec is not None else None,
-                            "premium_sim": bool(premium_sim) if premium_sim is not None else None,
-                        }
-                    ),
+                    scenario_json,
                     cpu_request,
                     memory_gi,
                 ),

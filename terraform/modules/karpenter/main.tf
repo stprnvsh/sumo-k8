@@ -219,8 +219,11 @@ resource "kubernetes_manifest" "karpenter_nodepool" {
             { key = "karpenter.sh/capacity-type", operator = "In", values = ["on-demand"] },
             { key = "karpenter.k8s.aws/instance-category", operator = "In", values = ["c", "m", "r"] },
             { key = "karpenter.k8s.aws/instance-generation", operator = "Gt", values = ["5"] },
-            { key = "karpenter.k8s.aws/instance-cpu", operator = "Gt", values = ["32"] },
-            { key = "karpenter.k8s.aws/instance-size", operator = "In", values = ["4xlarge", "8xlarge", "9xlarge", "12xlarge", "16xlarge"] },
+            # Floor at >16 vCPU so the smallest node (8xlarge = 32 vCPU) fits a 16 vCPU/32Gi pod;
+            # Karpenter bin-packs bigger requests onto larger nodes. Broaden sizes for ICE resistance
+            # (one sim per node stays enforced by pod anti-affinity, so larger nodes just add headroom).
+            { key = "karpenter.k8s.aws/instance-cpu", operator = "Gt", values = ["16"] },
+            { key = "karpenter.k8s.aws/instance-size", operator = "In", values = ["8xlarge", "9xlarge", "12xlarge", "16xlarge", "24xlarge", "48xlarge"] },
           ]
         }
       }

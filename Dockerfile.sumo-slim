@@ -1,6 +1,13 @@
 # Stage 1: Build SUMO from Transcality source branch
 FROM ubuntu:22.04 AS sumo-full
 
+# Arrow is pinned on BOTH sides. The builder took libarrow-dev unpinned while
+# the runtime hard-pinned libarrow2400, so once Arrow's apt repo moved to 25.x
+# the build linked libparquet.so.2500 against a runtime shipping only 24.0.0:
+#   sumo: error while loading shared libraries: libparquet.so.2500
+# Both stages must name the same version or the image stops working silently.
+ARG ARROW_VERSION=25.0.1-1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -24,8 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y /tmp/arrow.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-    libarrow-dev \
-    libparquet-dev \
+    libarrow-dev=${ARROW_VERSION} \
+    libparquet-dev=${ARROW_VERSION} \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow.deb
 
 RUN git clone --recursive --branch simreplay-fix https://github.com/Transcality/sumo-transcality.git /tmp/sumo-src \
@@ -35,6 +42,7 @@ RUN git clone --recursive --branch simreplay-fix https://github.com/Transcality/
 
 # Stage 2: Minimal runtime  
 FROM ubuntu:22.04
+ARG ARROW_VERSION=25.0.1-1
 
 # Install runtime deps + Arrow/Parquet + Python
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -54,7 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://apache.jfrog.io/artifactory/arrow/ubuntu/apache-arrow-apt-source-latest-jammy.deb -o /tmp/arrow.deb \
     && apt-get install -y /tmp/arrow.deb \
     && apt-get update \
-    && apt-get install -y --no-install-recommends libarrow2400 libparquet2400 \
+    && apt-get install -y --no-install-recommends \
+    libarrow2500=${ARROW_VERSION} libparquet2500=${ARROW_VERSION} \
     && rm -rf /var/lib/apt/lists/* /tmp/arrow.deb
 
 # Copy SUMO binary

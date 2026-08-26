@@ -236,7 +236,7 @@ esac
 # Build and load image (for local clusters)
 if [ "$CLUSTER_TYPE" = "kind" ]; then
     echo -e "${YELLOW}Building Docker image...${NC}"
-    docker build -t "${IMAGE_NAME:-sumo-k8-controller}:latest" "$PROJECT_DIR"
+    docker build --platform linux/amd64 -t "${IMAGE_NAME:-sumo-k8-controller}:latest" "$PROJECT_DIR"
     
     echo -e "${YELLOW}Loading image into kind cluster...${NC}"
     kind load docker-image "${IMAGE_NAME:-sumo-k8-controller}:latest" --name "$CLUSTER_NAME"

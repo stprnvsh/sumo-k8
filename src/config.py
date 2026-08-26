@@ -8,6 +8,10 @@ logger = logging.getLogger(__name__)
 # Production configuration
 MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "100"))
 MAX_JOB_DURATION_HOURS = int(os.getenv("MAX_JOB_DURATION_HOURS", "24"))
+# PENDING/RUNNING rows with no live K8s workload are failed after this many hours.
+STALE_ACTIVE_JOB_HOURS = int(os.getenv("STALE_ACTIVE_JOB_HOURS", "6"))
+# Idle K8s Job (no running pod) with no S3 results: reconcile after this many seconds.
+GHOST_IDLE_GRACE_SECONDS = int(os.getenv("GHOST_IDLE_GRACE_SECONDS", "180"))
 CONFIGMAP_CLEANUP_DELAY_SECONDS = int(os.getenv("CONFIGMAP_CLEANUP_DELAY_SECONDS", "300"))
 MAX_CONCURRENT_JOBS_PER_TENANT = int(os.getenv("MAX_CONCURRENT_JOBS_PER_TENANT", "10"))
 # Accepted-but-not-yet-dispatched jobs
@@ -22,7 +26,7 @@ DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 # Default tenant limits
 DEFAULT_MAX_CPU = int(os.getenv("DEFAULT_MAX_CPU", "32"))
 DEFAULT_MAX_MEMORY_GI = int(os.getenv("DEFAULT_MAX_MEMORY_GI", "128"))
-DEFAULT_MAX_CONCURRENT_JOBS = int(os.getenv("DEFAULT_MAX_CONCURRENT_JOBS", "2"))
+DEFAULT_MAX_CONCURRENT_JOBS = int(os.getenv("DEFAULT_MAX_CONCURRENT_JOBS", "20"))
 
 # API key settings
 API_KEY_PREFIX = os.getenv("API_KEY_PREFIX", "sk-")
@@ -82,3 +86,9 @@ SIMULATION_PREFERRED_ZONES = [
 JOB_COST_CPU_USD_PER_HOUR = float(os.getenv("JOB_COST_CPU_USD_PER_HOUR", "0"))
 JOB_COST_MEMORY_GIB_USD_PER_HOUR = float(os.getenv("JOB_COST_MEMORY_GIB_USD_PER_HOUR", "0"))
 JOB_COST_AWS_INSTANCE_TYPE = os.getenv("JOB_COST_AWS_INSTANCE_TYPE", "").strip()
+
+# Node reservations
+RESERVATION_DEFAULT_TTL_SECONDS = int(os.getenv("RESERVATION_DEFAULT_TTL_SECONDS", "600"))
+RESERVATION_MAX_TTL_SECONDS = int(os.getenv("RESERVATION_MAX_TTL_SECONDS", "1800"))
+# Lightweight image for placeholder pods — avoids pulling the full SUMO image during pre-warm
+PLACEHOLDER_IMAGE = os.getenv("PLACEHOLDER_IMAGE", "busybox:1.36")

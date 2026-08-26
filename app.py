@@ -4,13 +4,16 @@ import signal
 import sys
 import threading
 import logging
+import uuid
+import json
 from datetime import datetime
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends, Body
+from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form, Depends, Body, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import boto3
 
 # Import modules
-from src import config
+from src import config, org_audit
 from src.database import init_db_pool, close_db_pool, get_db
 from src.k8s_client import k8s_available
 from src.auth import (
@@ -21,7 +24,12 @@ from src.jobs import submit_job, get_job_status, get_job_logs
 from src.logs import stream_job_logs
 from src.scaling import get_cluster_nodes, get_cluster_activity, ensure_tenant_namespace
 from src.reconciler import sync_job_status, cleanup_old_configmaps
-from src.models import TenantCreate, TenantResponse, APIKeyRegenerate
+from src.models import TenantCreate, TenantResponse, APIKeyRegenerate, ReservationCreate
+from src.reservations import (
+    create_reservation,
+    get_reservation,
+    delete_reservation,
+)
 from src.storage import detect_storage_type, list_s3_files
 
 # Configure logging
@@ -36,6 +44,55 @@ app = FastAPI(
     description="Multi-tenant Kubernetes job controller for SUMO simulations",
     version="1.0.0"
 )
+
+
+def _service_iam_role_arn() -> str:
+    value = (os.getenv("SERVICE_IAM_ROLE_ARN") or "").strip()
+    if value:
+        return value
+    try:
+        return boto3.client("sts", region_name=config.AWS_REGION).get_caller_identity().get("Arn", "")
+    except Exception:
+        return ""
+
+
+SERVICE_IAM_ROLE_ARN = _service_iam_role_arn()
+
+
+def _env_name() -> str:
+    env = (os.getenv("DEPLOY_ENV") or os.getenv("ENV") or "").strip().lower()
+    if env in ("prod", "production", "plan"):
+        return "prod"
+    if env in ("dev", "development", "plantest"):
+        return "dev"
+    return env or "dev"
+
+
+def _log_structured(event: str, **fields):
+    tenant_id = fields.get("tenant_id")
+    org_id = fields.pop("org_id", None)
+    if org_id is None and tenant_id:
+        org_id = org_audit.org_id_from_tenant_id(tenant_id)
+    payload = {
+        "event": event,
+        "source": "sumo-k8",
+        "audit_key": f"k8s.{event}",
+        "component": "k8s_controller",
+        "log_type": "k8s_controller",
+        "env": _env_name(),
+        "iam_role_arn": SERVICE_IAM_ROLE_ARN,
+        "organisation_id": org_id,
+        "simulation_id": fields.get("simulation_id"),
+        "execution_arn": fields.get("execution_arn"),
+        "tenant_id": tenant_id,
+        "request_id": fields.get("request_id"),
+    }
+    for k, v in fields.items():
+        if k not in payload:
+            payload[k] = v
+    logger.info(json.dumps(payload, default=str))
+    if tenant_id:
+        org_audit.put_org_audit_line(tenant_id, payload)
 
 # ============================================================================
 # Admin Auth (X-Admin-Key)
@@ -57,6 +114,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    tenant_id = None
+    org_id = None
+    auth = request.headers.get("Authorization")
+    if auth:
+        try:
+            tenant = get_tenant_from_header(auth)
+            tenant_id = tenant.get("tenant_id")
+            org_id = org_audit.org_id_from_tenant_id(tenant_id)
+        except Exception:
+            pass
+    started = datetime.now()
+    response = await call_next(request)
+    duration_ms = int((datetime.now() - started).total_seconds() * 1000)
+    xh_sim = (request.headers.get("X-Simulation-Id") or "").strip() or None
+    xh_arn = (request.headers.get("X-Execution-Arn") or "").strip() or None
+    _log_structured(
+        "http_request",
+        request_id=request_id,
+        tenant_id=tenant_id,
+        org_id=org_id,
+        simulation_id=xh_sim,
+        execution_arn=xh_arn,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        duration_ms=duration_ms,
+    )
+    response.headers["X-Request-Id"] = request_id
+    return response
 
 # ============================================================================
 # Health & Readiness Endpoints
@@ -159,16 +250,33 @@ def update_tenant(
 
 @app.post("/jobs")
 async def submit_job_endpoint(
+    request: Request,
     scenario_id: str = Form(..., min_length=1, max_length=100),
     cpu_request: int = Form(2, ge=1, le=32),
     memory_gi: int = Form(4, ge=1, le=128),
     sumo_files: UploadFile | None = File(None),
     sumo_files_s3_url: str | None = Form(None),
     task_token: str | None = Form(None),
+    reservation_id: str | None = Form(None),
     authorization: str = Header(None, alias="Authorization")
 ):
-    """Submit a SUMO simulation job"""
+    """Submit a SUMO simulation job.
+
+    Pass reservation_id to skip the queue and start immediately on a pre-warmed node.
+    """
     tenant = get_tenant_from_header(authorization)
+    rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    xh_arn = (request.headers.get("X-Execution-Arn") or "").strip() or None
+    _log_structured(
+        "submit_job",
+        request_id=rid,
+        tenant_id=tenant.get("tenant_id"),
+        org_id=org_audit.org_id_from_tenant_id(tenant.get("tenant_id")),
+        simulation_id=scenario_id,
+        execution_arn=xh_arn,
+        cpu_request=cpu_request,
+        memory_gi=memory_gi,
+    )
     return await submit_job(
         tenant,
         scenario_id,
@@ -177,10 +285,13 @@ async def submit_job_endpoint(
         sumo_files=sumo_files,
         sumo_files_s3_url=sumo_files_s3_url,
         task_token=task_token,
+        reservation_id=reservation_id or None,
+        execution_arn=xh_arn,
     )
 
 @app.post("/jobs/s3")
 async def submit_job_s3_endpoint(
+    request: Request,
     payload: dict = Body(...),
     authorization: str = Header(None, alias="Authorization"),
 ):
@@ -204,7 +315,24 @@ async def submit_job_s3_endpoint(
     progress_start_sec = payload.get("progress_start_sec")
     progress_end_sec = payload.get("progress_end_sec")
     premium_sim = payload.get("premium_sim")
+    reservation_id = payload.get("reservation_id") or None
+    execution_arn = str(payload.get("execution_arn") or "").strip() or None
     tenant = get_tenant_from_header(authorization)
+    rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    xh_arn = (request.headers.get("X-Execution-Arn") or "").strip() or execution_arn
+    _log_structured(
+        "submit_job_s3",
+        request_id=rid,
+        tenant_id=tenant.get("tenant_id"),
+        org_id=org_audit.org_id_from_tenant_id(tenant.get("tenant_id")),
+        simulation_id=progress_simulation_id or scenario_id,
+        execution_arn=xh_arn,
+        scenario_id=scenario_id,
+        cpu_request=cpu_request,
+        memory_gi=memory_gi,
+        has_single_s3_url=has_s3_url,
+        s3_file_count=len(sumo_files_s3_urls or []),
+    )
     return await submit_job(
         tenant,
         scenario_id,
@@ -219,6 +347,8 @@ async def submit_job_s3_endpoint(
         progress_start_sec=progress_start_sec,
         progress_end_sec=progress_end_sec,
         premium_sim=premium_sim,
+        reservation_id=reservation_id,
+        execution_arn=xh_arn,
     )
 
 @app.get("/jobs/{job_id}")
@@ -320,6 +450,50 @@ def get_job_results(job_id: str, authorization: str = Header(None, alias="Author
         result_info["message"] = "Result storage not configured"
     
     return result_info
+
+# ============================================================================
+# Reservation Endpoints (Tenant) — pre-warm a node before submitting a job
+# ============================================================================
+
+@app.post("/reservations")
+def create_reservation_endpoint(
+    body: ReservationCreate,
+    authorization: str = Header(None, alias="Authorization"),
+):
+    """Pre-warm a simulation node so the next job submission starts instantly.
+
+    Returns a reservation_id.  Pass it as reservation_id when calling POST /jobs
+    or POST /jobs/s3 to skip the queue and dispatch immediately onto the warm node.
+
+    The reservation expires after ttl_seconds (default 600s / 10 min).
+    """
+    tenant = get_tenant_from_header(authorization)
+    return create_reservation(tenant, body.cpu_request, body.memory_gi, body.ttl_seconds)
+
+
+@app.get("/reservations/{reservation_id}")
+def get_reservation_endpoint(
+    reservation_id: str,
+    authorization: str = Header(None, alias="Authorization"),
+):
+    """Poll reservation status.
+
+    status transitions: PENDING_NODE → READY → CLAIMED (or EXPIRED / FAILED).
+    Submit the job once status is READY for an instant start.
+    """
+    tenant = get_tenant_from_header(authorization)
+    return get_reservation(reservation_id, tenant["tenant_id"])
+
+
+@app.delete("/reservations/{reservation_id}", status_code=204)
+def delete_reservation_endpoint(
+    reservation_id: str,
+    authorization: str = Header(None, alias="Authorization"),
+):
+    """Cancel a reservation and release the pre-warmed node."""
+    tenant = get_tenant_from_header(authorization)
+    delete_reservation(reservation_id, tenant["tenant_id"])
+
 
 @app.get("/tenants/me/dashboard")
 def my_dashboard(authorization: str = Header(None, alias="Authorization")):
@@ -669,7 +843,9 @@ signal.signal(signal.SIGTERM, graceful_shutdown)
 def startup_event():
     """Initialize on startup"""
     init_db_pool()
-    
+    from src.database import ensure_db_schema
+    ensure_db_schema()
+
     if os.getenv("ENABLE_RECONCILER", "false").lower() == "true":
         reconciler_thread = threading.Thread(target=sync_job_status, daemon=True)
         reconciler_thread.start()

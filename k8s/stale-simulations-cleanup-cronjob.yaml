@@ -3,6 +3,10 @@ kind: CronJob
 metadata:
   name: stale-simulations-cleanup
   namespace: sumo-k8
+  annotations:
+    sumo-k8.transcality.com/cleanup-note: >-
+      Deletes Kubernetes Jobs/Pods only; does not update Postgres jobs rows.
+      Reconciler marks DB FAILED/SUCCEEDED on next 404 sync.
 spec:
   schedule: "0 * * * *"
   concurrencyPolicy: Forbid
